@@ -22,7 +22,7 @@ It does **not** mount anything, decode files, or write — it's a probe.
 - [x] GPT backup header read + validate, with primary/backup mismatch reporting (`gpt::parse_backup`, `gpt::validate_backup` returning `BackupStatus::Ok` / `Mismatch`)
 - [x] MBR with GPT-protective fallthrough
 - [x] FS sniff: ext2/3/4, NTFS, exFAT, FAT16, FAT32, HFS+, APFS, Linux swap, ISO 9660, SquashFS
-- [x] `SliceReader` adapter — rebases offsets on a sub-range of any `BlockRead`
+- [x] `SliceReader` adapter — rebases offsets on a sub-range of any `BlockRead` (planned to move into `am-fs-core` since slicing is a generic block-layer concern; this crate will re-export for backwards compatibility)
 - [x] C ABI for FFI (`partitions_probe`, `partitions_count`, `partitions_table_kind`, `partitions_get`, `partitions_sniff`, `partitions_open_slice`, `partitions_list_free`; header in `include/partitions.h`)
 - [ ] LVM / LUKS / mdraid detection
 - [ ] Logical-partition (extended MBR) chain walking
