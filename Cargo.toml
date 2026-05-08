@@ -1,0 +1,33 @@
+[package]
+name = "am-partitions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust partition-table probe (GPT/MBR) and filesystem-magic sniffer."
+repository = "https://github.com/antimatter-studios/rust-partitions"
+
+[lib]
+# Published as `am-partitions` on crates.io; consumers `use partitions::...`
+# inside their code. Decoupling the package name from the lib name keeps the
+# brand-y prefix out of every import statement.
+name = "partitions"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# IEEE 802.3 CRC32 — required for GPT header / partition-array validation.
+crc32fast = "1"
+# Block-device trait surface (BlockRead + FileDevice). Local path dep until
+# both crates publish; flip to a published version on the first release.
+am-fs-core = { path = "../rust-fs-core", version = "0.1" }
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"
