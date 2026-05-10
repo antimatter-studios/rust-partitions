@@ -177,8 +177,7 @@ impl PartitionSet {
 
         let start_lba = match start_hint {
             Some(byte) => {
-                let raw_sectors = byte / SECTOR_SIZE
-                    + if byte % SECTOR_SIZE != 0 { 1 } else { 0 };
+                let raw_sectors = byte / SECTOR_SIZE + if byte % SECTOR_SIZE != 0 { 1 } else { 0 };
                 let aligned = align_up(raw_sectors.max(first_usable_lba), ALIGNMENT_SECTORS);
                 if aligned < first_usable_lba {
                     return Err(Error::Invalid("hinted start before first usable LBA"));
@@ -333,12 +332,7 @@ impl PartitionSet {
     }
 
     /// First-fit free-space finder, walking partitions sorted by start LBA.
-    fn find_free(
-        &self,
-        length_sectors: u64,
-        first_usable: u64,
-        last_usable: u64,
-    ) -> Result<u64> {
+    fn find_free(&self, length_sectors: u64, first_usable: u64, last_usable: u64) -> Result<u64> {
         let mut sorted: Vec<&Partition> = self.partitions.iter().collect();
         sorted.sort_by_key(|p| p.start);
 
@@ -424,9 +418,7 @@ fn fill_from_prng(buf: &mut [u8]) {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9E37_79B9_7F4A_7C15);
     let pid = std::process::id() as u64;
-    let mut state = nanos
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(pid);
+    let mut state = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(pid);
     if state == 0 {
         state = 0x9E37_79B9_7F4A_7C15;
     }

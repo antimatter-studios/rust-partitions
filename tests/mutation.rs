@@ -125,7 +125,12 @@ fn gpt_alignment_preserved() {
     let (_, parts) = probe(&dev).unwrap();
     for p in &parts {
         assert_eq!(p.start % ONE_MIB, 0, "start not 1 MiB aligned: {}", p.start);
-        assert_eq!(p.length % ONE_MIB, 0, "length not 1 MiB aligned: {}", p.length);
+        assert_eq!(
+            p.length % ONE_MIB,
+            0,
+            "length not 1 MiB aligned: {}",
+            p.length
+        );
     }
 }
 
@@ -143,7 +148,12 @@ fn gpt_unaligned_hint_silently_aligned() {
         )
         .unwrap();
     let p = &set.partitions[idx];
-    assert_eq!(p.start, 2 * ONE_MIB, "expected snap to 2 MiB, got {}", p.start);
+    assert_eq!(
+        p.start,
+        2 * ONE_MIB,
+        "expected snap to 2 MiB, got {}",
+        p.start
+    );
     set.commit(&dev).unwrap();
     let (_, parts) = probe(&dev).unwrap();
     assert_eq!(parts.len(), 1);
@@ -177,10 +187,20 @@ fn gpt_overlap_rejected() {
 fn gpt_remove_round_trip() {
     let dev = MemDev::new(DISK_64M as usize);
     let mut set = PartitionSet::empty_gpt(DISK_64M);
-    set.add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, Some("a".into()))
-        .unwrap();
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("a".into()),
+    )
+    .unwrap();
     let idx = set
-        .add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, Some("b".into()))
+        .add(
+            None,
+            4 * ONE_MIB,
+            PartitionTypeId::LinuxFilesystem,
+            Some("b".into()),
+        )
         .unwrap();
     set.remove(PartitionRef::Index(idx)).unwrap();
     set.commit(&dev).unwrap();
@@ -221,8 +241,13 @@ fn gpt_resize_round_trip() {
 fn gpt_primary_and_backup_match_after_commit() {
     let dev = MemDev::new(DISK_64M as usize);
     let mut set = PartitionSet::empty_gpt(DISK_64M);
-    set.add(None, 4 * ONE_MIB, PartitionTypeId::EfiSystem, Some("EFI".into()))
-        .unwrap();
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::EfiSystem,
+        Some("EFI".into()),
+    )
+    .unwrap();
     set.add(
         None,
         8 * ONE_MIB,
@@ -282,14 +307,24 @@ fn gpt_backup_mismatch_detected() {
 fn gpt_from_probe_then_mutate_then_commit() {
     let dev = MemDev::new(DISK_64M as usize);
     let mut set = PartitionSet::empty_gpt(DISK_64M);
-    set.add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, Some("a".into()))
-        .unwrap();
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("a".into()),
+    )
+    .unwrap();
     set.commit(&dev).unwrap();
 
     let mut reloaded = PartitionSet::from_probe(&dev).unwrap();
     assert_eq!(reloaded.partitions.len(), 1);
     reloaded
-        .add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, Some("b".into()))
+        .add(
+            None,
+            4 * ONE_MIB,
+            PartitionTypeId::LinuxFilesystem,
+            Some("b".into()),
+        )
         .unwrap();
     reloaded.commit(&dev).unwrap();
 
@@ -322,8 +357,14 @@ fn mbr_round_trip_two_partitions() {
     assert_eq!(parts.len(), 2);
     let mut parts = parts;
     parts.sort_by_key(|p| p.start);
-    assert!(matches!(parts[0].kind, PartitionKind::Mbr { type_byte: 0x83 }));
-    assert!(matches!(parts[1].kind, PartitionKind::Mbr { type_byte: 0x82 }));
+    assert!(matches!(
+        parts[0].kind,
+        PartitionKind::Mbr { type_byte: 0x83 }
+    ));
+    assert!(matches!(
+        parts[1].kind,
+        PartitionKind::Mbr { type_byte: 0x82 }
+    ));
     for p in &parts {
         assert_eq!(p.start % ONE_MIB, 0);
         assert_eq!(p.length, 4 * ONE_MIB);
