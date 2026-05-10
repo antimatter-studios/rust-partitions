@@ -72,8 +72,14 @@ fn mbr_two_primaries() {
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0].start, 2048 * 512);
     assert_eq!(parts[0].length, 2048 * 512);
-    assert!(matches!(parts[0].kind, PartitionKind::Mbr { type_byte: 0x83 }));
-    assert!(matches!(parts[1].kind, PartitionKind::Mbr { type_byte: 0x82 }));
+    assert!(matches!(
+        parts[0].kind,
+        PartitionKind::Mbr { type_byte: 0x83 }
+    ));
+    assert!(matches!(
+        parts[1].kind,
+        PartitionKind::Mbr { type_byte: 0x82 }
+    ));
 }
 
 #[test]
@@ -154,7 +160,7 @@ fn build_gpt_with_entries(dev: &Bytes, entries: &[GptFixtureEntry]) -> (u64, u64
     header[0..8].copy_from_slice(b"EFI PART");
     header[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // revision
     header[12..16].copy_from_slice(&92u32.to_le_bytes()); // header_size
-    // CRC field at 16..20 left zero for now.
+                                                          // CRC field at 16..20 left zero for now.
     header[20..24].copy_from_slice(&0u32.to_le_bytes()); // reserved
     header[24..32].copy_from_slice(&1u64.to_le_bytes()); // my_lba
     header[32..40].copy_from_slice(&(total_sectors - 1).to_le_bytes()); // alternate_lba
@@ -181,13 +187,7 @@ fn gpt_with_two_partitions() {
     build_gpt_with_entries(
         &dev,
         &[
-            (
-                type_guids::EFI_SYSTEM,
-                [1u8; 16],
-                34,
-                2081,
-                "EFI",
-            ),
+            (type_guids::EFI_SYSTEM, [1u8; 16], 34, 2081, "EFI"),
             (
                 type_guids::LINUX_FILESYSTEM,
                 [2u8; 16],
@@ -256,7 +256,12 @@ fn sniff_ext4_with_extents() {
     // s_feature_incompat at 1024+0x60 = 1120 — set EXTENTS bit (0x40).
     buf[1120..1124].copy_from_slice(&0x40u32.to_le_bytes());
     let kind = classify(&buf);
-    assert_eq!(kind, FsKind::Ext { version: ExtVersion::Ext4 });
+    assert_eq!(
+        kind,
+        FsKind::Ext {
+            version: ExtVersion::Ext4
+        }
+    );
 }
 
 #[test]
@@ -267,7 +272,12 @@ fn sniff_ext3_journal_only() {
     // s_feature_compat at 1024+0x5C = 1116 — set HAS_JOURNAL (0x4).
     buf[1116..1120].copy_from_slice(&0x4u32.to_le_bytes());
     let kind = classify(&buf);
-    assert_eq!(kind, FsKind::Ext { version: ExtVersion::Ext3 });
+    assert_eq!(
+        kind,
+        FsKind::Ext {
+            version: ExtVersion::Ext3
+        }
+    );
 }
 
 #[test]

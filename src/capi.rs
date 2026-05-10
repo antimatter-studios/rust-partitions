@@ -164,8 +164,7 @@ pub unsafe extern "C" fn partitions_probe(
     unsafe {
         *list_out = ptr::null_mut();
     }
-    let parent_arc: Arc<dyn fs_core::BlockDevice> =
-        unsafe { (*device).inner().clone() };
+    let parent_arc: Arc<dyn fs_core::BlockDevice> = unsafe { (*device).inner().clone() };
 
     ffi_guard(|| {
         let (table, parts) = probe::probe(&*parent_arc).map_err(|e| {
@@ -434,10 +433,7 @@ mod tests {
             // partition length.
             let slice = partitions_open_slice(list_ptr, 0);
             assert!(!slice.is_null());
-            assert_eq!(
-                fs_core::ffi::fs_core_device_size_bytes(slice),
-                info.length
-            );
+            assert_eq!(fs_core::ffi::fs_core_device_size_bytes(slice), info.length);
             fs_core_device_close(slice);
 
             partitions_list_free(list_ptr);

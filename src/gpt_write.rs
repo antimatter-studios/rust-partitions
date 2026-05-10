@@ -64,7 +64,9 @@ pub fn write_gpt(
     let last_usable_lba = last_lba - ENTRY_ARRAY_SECTORS - 1; // = last_lba - 33
 
     if partitions.len() > NUM_ENTRIES as usize {
-        return Err(Error::Invalid("too many partitions for canonical 128-slot table"));
+        return Err(Error::Invalid(
+            "too many partitions for canonical 128-slot table",
+        ));
     }
 
     // Sort copy by start LBA so overlap detection is one linear pass.
@@ -91,9 +93,7 @@ pub fn write_gpt(
             PartitionKind::Gpt { type_guid } => type_guid,
             _ => return Err(Error::Invalid("non-GPT partition kind in GPT write")),
         };
-        let uuid = p
-            .uuid
-            .ok_or(Error::Invalid("GPT partition missing UUID"))?;
+        let uuid = p.uuid.ok_or(Error::Invalid("GPT partition missing UUID"))?;
         let start_lba = p.start / SECTOR_SIZE;
         let end_lba = (p.start + p.length) / SECTOR_SIZE - 1;
 
@@ -119,14 +119,14 @@ pub fn write_gpt(
     let mut mbr = [0u8; 512];
     // Partition 1 (offset 446): 0xEE spanning the disk.
     mbr[446] = 0x00; // boot indicator
-    // CHS first sector — write the canonical 0x00 0x02 0x00 trio meaning
-    // "head 0, sector 2, cylinder 0".
+                     // CHS first sector — write the canonical 0x00 0x02 0x00 trio meaning
+                     // "head 0, sector 2, cylinder 0".
     mbr[447] = 0x00;
     mbr[448] = 0x02;
     mbr[449] = 0x00;
     mbr[450] = 0xEE; // type byte
-    // CHS last sector — set to 0xFF 0xFF 0xFF (max) per the legacy convention
-    // when the LBA range exceeds what CHS can express.
+                     // CHS last sector — set to 0xFF 0xFF 0xFF (max) per the legacy convention
+                     // when the LBA range exceeds what CHS can express.
     mbr[451] = 0xFF;
     mbr[452] = 0xFF;
     mbr[453] = 0xFF;

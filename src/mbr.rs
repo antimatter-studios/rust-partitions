@@ -163,9 +163,9 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
         let sectors = (p.length / SECTOR_SIZE) as u32;
 
         sector[off] = 0x00; // boot indicator (none)
-        // CHS first/last left as zeros — modern OSes ignore CHS once LBA is
-        // present, and the legacy fields can't faithfully describe most
-        // modern geometry anyway.
+                            // CHS first/last left as zeros — modern OSes ignore CHS once LBA is
+                            // present, and the legacy fields can't faithfully describe most
+                            // modern geometry anyway.
         sector[off + 4] = type_byte;
         sector[off + 8..off + 12].copy_from_slice(&start_lba.to_le_bytes());
         sector[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
