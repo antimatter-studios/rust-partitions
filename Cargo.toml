@@ -1,6 +1,6 @@
 [package]
 name = "am-partitions"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust partition-table probe (GPT/MBR) and filesystem-magic sniffer."
@@ -18,7 +18,7 @@ crate-type = ["staticlib", "rlib"]
 crc32fast = "1"
 # Block-device trait surface (BlockRead + FileDevice). Local path dep until
 # both crates publish; flip to a published version on the first release.
-am-fs-core = { path = "../rust-fs-core", version = "0.1" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2" }
 
 [dev-dependencies]
 
