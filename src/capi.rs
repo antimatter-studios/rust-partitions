@@ -125,6 +125,16 @@ pub struct PartitionInfo {
     pub label: *const std::os::raw::c_char,
     /// Length of the label in bytes, excluding the NUL.
     pub label_len: usize,
+    /// 1 when the partition is marked bootable (MBR active flag, GPT
+    /// legacy-BIOS-bootable attribute, or GPT type == EFI System
+    /// Partition), 0 otherwise. Matches [`crate::Partition::is_bootable`].
+    pub bootable: u8,
+    /// 7 bytes of explicit padding so `attributes` lands on its natural
+    /// 8-byte boundary regardless of compiler.
+    pub _pad2: [u8; 7],
+    /// GPT 64-bit attributes field (entry offset +48). 0 for MBR /
+    /// Whole partitions. See [`crate::gpt::attr`] for named bits.
+    pub attributes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,10 +348,13 @@ fn make_label_string(label: Option<&str>) -> (*const std::os::raw::c_char, usize
 }
 
 fn build_info(p: &Partition, table: TableKindCode) -> PartitionInfo {
-    let (type_guid, type_byte) = match p.kind {
-        PartitionKind::Gpt { type_guid } => (type_guid, 0u8),
-        PartitionKind::Mbr { type_byte } => ([0u8; 16], type_byte),
-        PartitionKind::Whole => ([0u8; 16], 0u8),
+    let (type_guid, type_byte, attributes) = match p.kind {
+        PartitionKind::Gpt {
+            type_guid,
+            attributes,
+        } => (type_guid, 0u8, attributes),
+        PartitionKind::Mbr { type_byte, .. } => ([0u8; 16], type_byte, 0u64),
+        PartitionKind::Whole => ([0u8; 16], 0u8, 0u64),
     };
     PartitionInfo {
         start: p.start,
@@ -353,6 +366,9 @@ fn build_info(p: &Partition, table: TableKindCode) -> PartitionInfo {
         _pad: [0u8; 7],
         label: ptr::null(),
         label_len: 0,
+        bootable: if p.is_bootable() { 1 } else { 0 },
+        _pad2: [0u8; 7],
+        attributes,
     }
 }
 

@@ -74,11 +74,17 @@ fn mbr_two_primaries() {
     assert_eq!(parts[0].length, 2048 * 512);
     assert!(matches!(
         parts[0].kind,
-        PartitionKind::Mbr { type_byte: 0x83 }
+        PartitionKind::Mbr {
+            type_byte: 0x83,
+            active: _
+        }
     ));
     assert!(matches!(
         parts[1].kind,
-        PartitionKind::Mbr { type_byte: 0x82 }
+        PartitionKind::Mbr {
+            type_byte: 0x82,
+            active: _
+        }
     ));
 }
 
@@ -205,7 +211,7 @@ fn gpt_with_two_partitions() {
     assert_eq!(parts[0].length, (2081 - 34 + 1) * 512);
     assert_eq!(parts[0].label.as_deref(), Some("EFI"));
     assert_eq!(parts[1].label.as_deref(), Some("rootfs"));
-    if let PartitionKind::Gpt { type_guid } = parts[1].kind {
+    if let PartitionKind::Gpt { type_guid, .. } = parts[1].kind {
         assert_eq!(type_guid, type_guids::LINUX_FILESYSTEM);
     } else {
         panic!("expected GPT partition kind");
@@ -368,7 +374,10 @@ fn sniff_through_partition_offset() {
     let part = Partition {
         start: 4096,
         length: 8192,
-        kind: PartitionKind::Mbr { type_byte: 0x07 },
+        kind: PartitionKind::Mbr {
+            type_byte: 0x07,
+            active: false,
+        },
         label: None,
         uuid: None,
     };

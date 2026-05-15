@@ -78,12 +78,18 @@ pub fn is_protective(lba0: &[u8; 512]) -> bool {
     nonempty == 1 && all_protective
 }
 
+/// MBR active/boot flag mask. The "status byte" at offset +0 of each entry
+/// holds this in its high bit; legacy BIOS firmware boots from the partition
+/// where this bit is set.
+pub const STATUS_ACTIVE: u8 = 0x80;
+
 /// Parse the four primary entries. Empty entries are skipped. Extended-LBA
 /// entries are reported as-is — chain walking is not yet implemented.
 pub fn parse(lba0: &[u8; 512]) -> Result<Vec<Partition>> {
     let mut out = Vec::new();
     for i in 0..4 {
         let off = 446 + i * 16;
+        let status = lba0[off];
         let type_byte = lba0[off + 4];
         if type_byte == types::EMPTY {
             continue;
@@ -101,10 +107,11 @@ pub fn parse(lba0: &[u8; 512]) -> Result<Vec<Partition>> {
         }
         let start = (starting_lba as u64) * SECTOR_SIZE;
         let length = (sectors as u64) * SECTOR_SIZE;
+        let active = (status & STATUS_ACTIVE) != 0;
         out.push(Partition {
             start,
             length,
-            kind: PartitionKind::Mbr { type_byte },
+            kind: PartitionKind::Mbr { type_byte, active },
             label: None,
             uuid: None,
         });
@@ -155,17 +162,17 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
     let mut sector = [0u8; 512];
     for (i, p) in partitions.iter().enumerate() {
         let off = 446 + i * 16;
-        let type_byte = match p.kind {
-            PartitionKind::Mbr { type_byte } => type_byte,
+        let (type_byte, active) = match p.kind {
+            PartitionKind::Mbr { type_byte, active } => (type_byte, active),
             _ => return Err(Error::Invalid("non-MBR partition kind in MBR write")),
         };
         let start_lba = (p.start / SECTOR_SIZE) as u32;
         let sectors = (p.length / SECTOR_SIZE) as u32;
 
-        sector[off] = 0x00; // boot indicator (none)
-                            // CHS first/last left as zeros — modern OSes ignore CHS once LBA is
-                            // present, and the legacy fields can't faithfully describe most
-                            // modern geometry anyway.
+        sector[off] = if active { STATUS_ACTIVE } else { 0x00 };
+        // CHS first/last left as zeros — modern OSes ignore CHS once LBA is
+        // present, and the legacy fields can't faithfully describe most
+        // modern geometry anyway.
         sector[off + 4] = type_byte;
         sector[off + 8..off + 12].copy_from_slice(&start_lba.to_le_bytes());
         sector[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());

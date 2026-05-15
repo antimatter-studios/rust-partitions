@@ -53,6 +53,35 @@ use crate::BlockRead;
 pub const SIGNATURE: &[u8; 8] = b"EFI PART";
 pub const SECTOR_SIZE: u64 = 512;
 
+/// Named bits inside the 64-bit partition attributes field (entry offset
+/// +48). Bits 0..47 are defined by the partition-table spec; bits 48..63 are
+/// reserved for "partition-type-specific" use and are commonly hijacked by
+/// Microsoft (read-only / shadow / hidden / no-automount on basic-data
+/// partitions). Callers can `(attributes & attr::LEGACY_BIOS_BOOTABLE) != 0`
+/// to test a single bit.
+pub mod attr {
+    /// Bit 0: "Required Partition" — system depends on it; OS installers
+    /// should not delete or move it.
+    pub const REQUIRED_PARTITION: u64 = 1 << 0;
+    /// Bit 1: "No Block IO Protocol" — UEFI firmware should not expose a
+    /// block I/O protocol on this partition. Rarely set.
+    pub const NO_BLOCK_IO_PROTOCOL: u64 = 1 << 1;
+    /// Bit 2: "Legacy BIOS Bootable" — the partition contains a legacy
+    /// (non-UEFI) bootloader and is meant to be booted on BIOS systems.
+    /// Distro install ISOs that boot on both BIOS and UEFI typically set
+    /// this on the BIOS-boot or root partition in addition to providing
+    /// an ESP.
+    pub const LEGACY_BIOS_BOOTABLE: u64 = 1 << 2;
+    /// Bit 60: Microsoft "Read-Only" attribute on basic-data partitions.
+    pub const MS_READ_ONLY: u64 = 1 << 60;
+    /// Bit 61: Microsoft "Shadow Copy" attribute.
+    pub const MS_SHADOW_COPY: u64 = 1 << 61;
+    /// Bit 62: Microsoft "Hidden" attribute.
+    pub const MS_HIDDEN: u64 = 1 << 62;
+    /// Bit 63: Microsoft "No Drive Letter / No Automount" attribute.
+    pub const MS_NO_AUTOMOUNT: u64 = 1 << 63;
+}
+
 /// Type GUIDs for partitions we can match (binary form, mixed-endian as on
 /// disk). Useful for callers that want to filter without re-deriving them.
 pub mod type_guids {
@@ -191,6 +220,7 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
         if end_lba < start_lba {
             return Err(Error::GptCorrupt("ending_lba < starting_lba"));
         }
+        let attributes = u64::from_le_bytes(array[off + 48..off + 56].try_into().unwrap());
         let start = start_lba * SECTOR_SIZE;
         let length = (end_lba - start_lba + 1) * SECTOR_SIZE;
 
@@ -200,7 +230,10 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
         out.push(Partition {
             start,
             length,
-            kind: PartitionKind::Gpt { type_guid },
+            kind: PartitionKind::Gpt {
+                type_guid,
+                attributes,
+            },
             label,
             uuid: Some(unique_guid),
         });

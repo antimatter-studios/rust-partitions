@@ -89,8 +89,11 @@ pub fn write_gpt(
     let mut array = vec![0u8; ENTRY_ARRAY_BYTES as usize];
     for (idx, p) in partitions.iter().enumerate() {
         let off = idx * ENTRY_SIZE as usize;
-        let type_guid = match p.kind {
-            PartitionKind::Gpt { type_guid } => type_guid,
+        let (type_guid, attributes) = match p.kind {
+            PartitionKind::Gpt {
+                type_guid,
+                attributes,
+            } => (type_guid, attributes),
             _ => return Err(Error::Invalid("non-GPT partition kind in GPT write")),
         };
         let uuid = p.uuid.ok_or(Error::Invalid("GPT partition missing UUID"))?;
@@ -101,7 +104,7 @@ pub fn write_gpt(
         array[off + 16..off + 32].copy_from_slice(&uuid);
         array[off + 32..off + 40].copy_from_slice(&start_lba.to_le_bytes());
         array[off + 40..off + 48].copy_from_slice(&end_lba.to_le_bytes());
-        // attributes (8 bytes) left zero
+        array[off + 48..off + 56].copy_from_slice(&attributes.to_le_bytes());
         if let Some(label) = &p.label {
             // 72 bytes UTF-16 LE, zero-padded; truncate at 36 code units.
             let name_off = off + 56;
@@ -193,7 +196,7 @@ fn validate_partition(p: &Partition, first_usable: u64, last_usable: u64) -> Res
     if end_lba > last_usable {
         return Err(Error::Invalid("partition ends past last usable LBA"));
     }
-    if let PartitionKind::Gpt { type_guid } = p.kind {
+    if let PartitionKind::Gpt { type_guid, .. } = p.kind {
         if type_guid == type_guids::UNUSED {
             return Err(Error::Invalid("partition type GUID is the unused sentinel"));
         }
