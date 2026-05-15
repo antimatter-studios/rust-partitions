@@ -103,7 +103,7 @@ fn gpt_round_trip_two_partitions() {
     parts.sort_by_key(|p| p.start);
     assert_eq!(parts[0].length, 8 * ONE_MIB);
     assert_eq!(parts[0].label.as_deref(), Some("EFI"));
-    if let PartitionKind::Gpt { type_guid } = parts[0].kind {
+    if let PartitionKind::Gpt { type_guid, .. } = parts[0].kind {
         assert_eq!(type_guid, type_guids::EFI_SYSTEM);
     } else {
         panic!("expected GPT kind");
@@ -359,11 +359,17 @@ fn mbr_round_trip_two_partitions() {
     parts.sort_by_key(|p| p.start);
     assert!(matches!(
         parts[0].kind,
-        PartitionKind::Mbr { type_byte: 0x83 }
+        PartitionKind::Mbr {
+            type_byte: 0x83,
+            active: _
+        }
     ));
     assert!(matches!(
         parts[1].kind,
-        PartitionKind::Mbr { type_byte: 0x82 }
+        PartitionKind::Mbr {
+            type_byte: 0x82,
+            active: _
+        }
     ));
     for p in &parts {
         assert_eq!(p.start % ONE_MIB, 0);

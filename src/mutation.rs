@@ -208,12 +208,18 @@ impl PartitionSet {
             }
         }
 
+        // New partitions default to non-bootable / no special attributes.
+        // Callers that want to mark an active partition or set GPT
+        // attribute bits should mutate the partition kind in-place after
+        // the add() call.
         let kind = match self.table_kind {
             TableKind::Gpt => PartitionKind::Gpt {
                 type_guid: type_id.to_gpt_guid()?,
+                attributes: 0,
             },
             TableKind::Mbr => PartitionKind::Mbr {
                 type_byte: type_id.to_mbr_byte()?,
+                active: false,
             },
         };
         let uuid = if self.table_kind == TableKind::Gpt {

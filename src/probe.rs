@@ -24,14 +24,54 @@ pub struct Partition {
     pub uuid: Option<[u8; 16]>,
 }
 
-/// The on-disk type-tag for the partition. For GPT this is the type GUID; for
-/// MBR it's the one-byte type code. `Whole` is reserved for the (future)
-/// "no partition table" probe result.
+/// The on-disk type-tag for the partition. For GPT this is the type GUID +
+/// the 64-bit attributes field; for MBR it's the one-byte type code + the
+/// active/boot flag. `Whole` is reserved for the (future) "no partition
+/// table" probe result.
+///
+/// Callers that only need a "did the firmware mark this as bootable?" answer
+/// should use [`Partition::is_bootable`] instead of inspecting bits directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionKind {
-    Gpt { type_guid: [u8; 16] },
-    Mbr { type_byte: u8 },
+    /// `type_guid`: 16-byte on-disk partition type GUID.
+    /// `attributes`: 64-bit attributes field from entry offset +48. Bit 0 =
+    ///   required partition, bit 2 = legacy BIOS bootable; see
+    ///   [`crate::gpt::attr`] for the full set of named bits.
+    Gpt {
+        type_guid: [u8; 16],
+        attributes: u64,
+    },
+    /// `type_byte`: MBR partition type code.
+    /// `active`: bit 0x80 of the entry's status byte (offset +0). Marks the
+    ///   "active" / "bootable" partition that legacy BIOS firmware boots.
+    Mbr {
+        type_byte: u8,
+        active: bool,
+    },
     Whole,
+}
+
+impl Partition {
+    /// True when this partition is marked bootable in the on-disk table.
+    ///
+    /// - MBR: the active flag is set on the entry (legacy BIOS boots from
+    ///   the active partition).
+    /// - GPT: the type GUID is the EFI System Partition GUID *or* the
+    ///   `LEGACY_BIOS_BOOTABLE` attribute bit is set.
+    /// - Whole: never (no firmware-level bootability for table-less media).
+    pub fn is_bootable(&self) -> bool {
+        match self.kind {
+            PartitionKind::Mbr { active, .. } => active,
+            PartitionKind::Gpt {
+                type_guid,
+                attributes,
+            } => {
+                type_guid == crate::gpt::type_guids::EFI_SYSTEM
+                    || (attributes & crate::gpt::attr::LEGACY_BIOS_BOOTABLE) != 0
+            }
+            PartitionKind::Whole => false,
+        }
+    }
 }
 
 /// Probe the device. Returns `(table_kind, partitions)` on success.
