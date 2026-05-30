@@ -288,6 +288,43 @@ pub unsafe extern "C" fn partitions_sniff(list: *const PartitionList, index: usi
     })
 }
 
+/// Sniff the filesystem type for the whole device — for use when
+/// [`partitions_probe`] returns no partition table. `device_size_bytes`
+/// is the virtual size of the device (from `fs_core_device_size_bytes`).
+/// Returns a [`FsKindCode`] discriminant as `i32`, or -1 on error
+/// (last-error has detail).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn partitions_sniff_device(
+    device: *const FsCoreDevice,
+    device_size_bytes: u64,
+) -> i32 {
+    if device.is_null() {
+        set_last_error("partitions_sniff_device: device is null");
+        return -1;
+    }
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let parent: Arc<dyn fs_core::BlockDevice> = unsafe { (*device).inner().clone() };
+        let synthetic = Partition {
+            start: 0,
+            length: device_size_bytes,
+            kind: PartitionKind::Whole,
+            label: None,
+            uuid: None,
+        };
+        match sniff::sniff(&*parent, &synthetic) {
+            Ok(kind) => FsKindCode::from(kind) as i32,
+            Err(e) => {
+                set_last_error(e.to_string());
+                -1
+            }
+        }
+    }));
+    result.unwrap_or_else(|_| {
+        set_last_error("panic in partitions_sniff_device");
+        -1
+    })
+}
+
 /// Build a child `FsCoreDevice` whose byte 0 maps to the start of
 /// partition `index`. Useful for handing one partition to a filesystem
 /// driver as if it were a whole disk. Returns NULL on error.
