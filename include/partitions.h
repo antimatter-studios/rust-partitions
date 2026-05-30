@@ -92,6 +92,9 @@ FsCoreErrorCode  partitions_get(const PartitionList *list,
                                  PartitionInfo *out);
 /* Returns one of PartitionsFsKind, or -1 on error (last-error has detail). */
 int32_t          partitions_sniff(const PartitionList *list, size_t index);
+/* Sniff the whole device (no partition table). Returns one of PartitionsFsKind, or -1 on error. */
+int32_t          partitions_sniff_device(const FsCoreDevice *device,
+                                          uint64_t device_size_bytes);
 /* Returns NULL on error (last-error has detail). */
 FsCoreDevice   *partitions_open_slice(const PartitionList *list, size_t index);
 void             partitions_list_free(PartitionList *list);
