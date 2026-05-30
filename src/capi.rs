@@ -302,6 +302,10 @@ pub unsafe extern "C" fn partitions_sniff_device(
         set_last_error("partitions_sniff_device: device is null");
         return -1;
     }
+    if device_size_bytes == 0 {
+        set_last_error("partitions_sniff_device: device_size_bytes is zero");
+        return -1;
+    }
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let parent: Arc<dyn fs_core::BlockDevice> = unsafe { (*device).inner().clone() };
         let synthetic = Partition {
@@ -492,6 +496,39 @@ mod tests {
             partitions_list_free(list_ptr);
             fs_core_device_close(dev);
         }
+    }
+
+    fn make_whole_ntfs_device() -> *mut FsCoreDevice {
+        let mut bytes = vec![0u8; 4 * 1024 * 1024];
+        // Plant NTFS OEM ID at offset 3.
+        bytes[3..11].copy_from_slice(b"NTFS    ");
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        let dev = Bytes(Mutex::new(bytes));
+        FsCoreDevice::into_handle(Arc::new(dev))
+    }
+
+    #[test]
+    fn sniff_device_null_returns_minus_one() {
+        let kind = unsafe { partitions_sniff_device(ptr::null(), 4 * 1024 * 1024) };
+        assert_eq!(kind, -1);
+    }
+
+    #[test]
+    fn sniff_device_zero_size_returns_minus_one() {
+        let dev = make_whole_ntfs_device();
+        let kind = unsafe { partitions_sniff_device(dev, 0) };
+        assert_eq!(kind, -1);
+        unsafe { fs_core_device_close(dev) };
+    }
+
+    #[test]
+    fn sniff_device_whole_ntfs_returns_ntfs_kind() {
+        let dev = make_whole_ntfs_device();
+        let size = 4 * 1024 * 1024u64;
+        let kind = unsafe { partitions_sniff_device(dev, size) };
+        assert_eq!(kind, FsKindCode::Ntfs as i32);
+        unsafe { fs_core_device_close(dev) };
     }
 
     #[test]
