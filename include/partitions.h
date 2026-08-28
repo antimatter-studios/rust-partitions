@@ -58,6 +58,13 @@ typedef enum {
  * PartitionInfo — POD struct copied out by partitions_get. The `label`
  * pointer (when non-NULL) and `type_guid` are owned by the parent
  * PartitionList; copy them out before `partitions_list_free`.
+ *
+ * This declaration mirrors, field for field, the #[repr(C)] struct of the
+ * same name in src/capi.rs. partitions_get writes a whole struct through
+ * the `out` pointer, so a mismatch here is a buffer overrun in the caller,
+ * not a compile error. tests/c_abi.rs compiles this header and static-
+ * asserts sizeof and every offsetof against the values Rust reports; keep
+ * the two in step or that test fails.
  * ------------------------------------------------------------------------- */
 
 typedef struct {
@@ -70,6 +77,12 @@ typedef struct {
     uint8_t        _pad[7];         /* alignment */
     const char    *label;           /* NUL-terminated UTF-8, or NULL */
     size_t         label_len;       /* bytes excluding the NUL */
+    uint8_t        bootable;        /* 1 = MBR active flag, GPT legacy-BIOS
+                                     * bootable attribute, or GPT type ==
+                                     * EFI System Partition; else 0 */
+    uint8_t        _pad2[7];        /* alignment */
+    uint64_t       attributes;      /* GPT attributes (entry offset +48);
+                                     * 0 for MBR and whole-device entries */
 } PartitionInfo;
 
 /* -------------------------------------------------------------------------
