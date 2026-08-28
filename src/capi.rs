@@ -137,6 +137,21 @@ pub struct PartitionInfo {
     pub attributes: u64,
 }
 
+// The C declaration of the struct above lives in `include/partitions.h` and
+// is maintained by hand, so the two can drift without anything complaining.
+// These pin the Rust side; `tests/c_abi.rs` compiles the header and pins the
+// C side against the same numbers. Changing the size here is a C ABI break —
+// bump the version and update the header in the same commit.
+//
+// Only stated for 64-bit targets: `label` and `label_len` are pointer-width,
+// so 80 is not a portable constant and a hard-coded one would refuse to
+// compile on a 32-bit target. `tests/c_abi.rs` has no such limit — it
+// compares Rust against a C compiler for whatever target is being built.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<PartitionInfo>() == 80);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(align_of::<PartitionInfo>() == 8);
+
 // ---------------------------------------------------------------------------
 // PartitionList — opaque to C; owns label CStrings + the parent device.
 // ---------------------------------------------------------------------------
