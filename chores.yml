@@ -1,0 +1,122 @@
+version: "3"
+chore_min_version: 0.6.0
+
+# THE CONTRACT THIS FILE EXISTS TO OWN.
+#
+# How to build rust-partitions is knowledge that belongs to rust-partitions.
+# `staticlib` is the whole interface a consumer needs, AND IT TAKES NO
+# OUTPUT DIRECTORY: it builds into this crate's own dist/, `chore artifact`
+# prints the absolute path of that DIRECTORY, and a consumer copies its
+# contents. It is the same pair of tasks, with the same contract, that every
+# sibling library exposes.
+#
+# `artifact` PRINTS A DIRECTORY, NOT A FILE. That is the one place this
+# differs from rust-blk-probe, whose single binary lets its `artifact` name a
+# file: this crate produces libpartitions.a AND the headers beside it, so
+# there is no single path to name.
+#
+# NOTHING IN DISKJOCKEY LINKS THIS ARCHIVE TODAY, and that is worth saying
+# rather than leaving a reader to wonder why the task exists. diskjockey
+# consumes am-partitions as a CRATE — through rust-disk-probe, and as a
+# dev-dependency of the img readers' `inspect` example — so it arrives
+# already linked inside somebody else's output. The task is here for
+# uniformity, for anyone building this crate on its own, and because the
+# moment a consumer does want the archive it should not have to learn the
+# triple.
+#
+# WHY fs_core.h IS COPIED TOO. include/partitions.h opens with
+# `#include "fs_core.h"` — the probe reads through a FsCoreDevice — so a
+# consumer given only partitions.h cannot compile. The path below is the same
+# one Cargo.toml resolves am-fs-core from, and NOTHING CHECKS THAT THE TWO
+# AGREE.
+vars:
+  TRIPLE: aarch64-apple-darwin
+  # `[package].name` is am-partitions; `[lib].name` is partitions, so cargo
+  # writes libpartitions.a. The header mirrors the lib name.
+  LIBNAME: partitions
+
+tasks:
+  staticlib:
+    desc: Build the static library and its headers into this crate's dist/
+    # NO `out` ARGUMENT, deliberately. A library does not write into its
+    # consumer. It builds into its own dist/ and a consumer asks where that
+    # is — `chore artifact` prints the path. Inverting it that way means this
+    # crate can change its output layout without every consumer knowing, and
+    # it stays independently usable with no consumer at all.
+    vars:
+      OUT: 'dist'
+
+    # These patterns are LITERAL on purpose. chore records a fingerprint by
+    # calling fingerprint.Save WITHOUT a renderer (internal/run/run.go:313),
+    # so a pattern containing {{ }} is expanded against the raw text, matches
+    # nothing, and stores the empty-set hash — the task then never registers
+    # as up to date.
+    sources:
+      - Cargo.toml
+      - 'src/**/*.rs'
+      - 'include/*.h'
+      # fs_core.h is a source of ours because we ship it (see the cp below).
+      # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do.
+      - '../rust-fs-core/include/fs_core.h'
+
+    # Templated, which is fine here where it is not fine above: UpToDate
+    # renders these before expanding them, and every entry is an exact path
+    # rather than a glob, so a missing artifact is caught by the pattern
+    # failing to match.
+    generates:
+      - '{{.OUT}}/lib{{.LIBNAME}}.a'
+      - '{{.OUT}}/include/{{.LIBNAME}}.h'
+
+    cmds:
+      # Idempotent: rustup answers "up to date" without touching the network
+      # when the target is already installed. It runs here rather than in the
+      # consumer because the triple is ours.
+      - 'rustup target add {{.TRIPLE}}'
+      - 'cargo build --release --target {{.TRIPLE}}'
+      - 'mkdir -p "{{.OUT}}/include"'
+      - 'cp target/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a "{{.OUT}}/lib{{.LIBNAME}}.a"'
+      - 'cp include/{{.LIBNAME}}.h "{{.OUT}}/include/{{.LIBNAME}}.h"'
+      - 'cp "../rust-fs-core/include/fs_core.h" "{{.OUT}}/include/fs_core.h"'
+
+  build:
+    desc: Debug build
+    cmds: ['cargo build']
+
+  test:
+    desc: Test suite
+    cmds: ['cargo test']
+
+  clean:
+    desc: Remove this crate's cargo output
+    cmds: ['cargo clean']
+
+  artifact:
+    desc: Print the absolute path of the directory holding the built outputs
+    # `silent: true` is what makes this usable as a VALUE — without it chore
+    # echoes each command and a caller capturing stdout gets the echo too.
+    # PATTERNS.md: "a value — a flag string, a container status, a path" is a
+    # task called through {{.CHORE_EXE}}.
+    silent: true
+    # NO `deps: [staticlib]`. chore prints "task: staticlib is up to date" on
+    # STDOUT, which a caller capturing this as a value receives as PART OF THE
+    # VALUE — measured on rust-blk-probe, where the capture came back as two
+    # lines and the caller's path check failed. A value-returning task returns
+    # a value and does nothing else; the caller builds first, then asks. Two
+    # calls, on purpose.
+    #
+    # IT PRINTS A DIRECTORY, NOT A FILE, and that is the one place this differs
+    # from rust-blk-probe's `artifact`. That crate produces a single binary, so
+    # it can name a file. This one produces libpartitions.a AND the headers
+    # beside it, so there is no single path to name — A CONSUMER COPIES THE
+    # CONTENTS of what this prints. A consumer that treats it as a file path
+    # will silently copy the wrong thing.
+    cmds:
+      - 'cd "{{.OUT}}" && pwd -P'
+    vars:
+      OUT: 'dist'
+
+  lint:
+    desc: Formatting and clippy, exactly as CI runs them
+    cmds:
+      - cargo fmt --check
+      - cargo clippy --locked --all-targets -- -D warnings
