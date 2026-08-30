@@ -30,6 +30,35 @@ use fs_core::BlockDevice;
 use crate::MBR_LBA_MAX;
 use crate::SECTOR_SIZE;
 
+/// The MBR partition table's layout.
+///
+/// `446 + i * 16` appeared at three sites and the per-entry field
+/// offsets at two more. One description instead of five, so a reader
+/// checks the table once.
+pub mod layout {
+    /// First byte of the partition table — the bootloader code ends here.
+    pub const TABLE_START: usize = 446;
+    /// Bytes per entry.
+    pub const ENTRY_SIZE: usize = 16;
+    /// Entries in the table. MBR has exactly four; more needs an
+    /// extended partition, which this crate does not write.
+    pub const ENTRY_COUNT: usize = 4;
+
+    /// Byte offset of entry `i` within the sector.
+    pub const fn entry_at(i: usize) -> usize {
+        TABLE_START + i * ENTRY_SIZE
+    }
+
+    /// `status` — 0x80 for the active/bootable entry.
+    pub const STATUS: usize = 0;
+    /// `partition type` byte.
+    pub const TYPE_BYTE: usize = 4;
+    /// `first LBA`, four bytes little-endian.
+    pub const START_LBA: usize = 8;
+    /// `sector count`, four bytes little-endian.
+    pub const SECTOR_COUNT: usize = 12;
+}
+
 /// One 0xEE entry that spans the whole disk = protective MBR (GPT lives here).
 ///
 /// The same byte as [`types::GPT_PROTECTIVE`], which is the spelling
@@ -67,9 +96,9 @@ pub mod types {
 pub fn is_protective(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> bool {
     let mut nonempty = 0;
     let mut all_protective = true;
-    for i in 0..4 {
-        let off = 446 + i * 16;
-        let type_byte = lba0[off + 4];
+    for i in 0..layout::ENTRY_COUNT {
+        let off = layout::entry_at(i);
+        let type_byte = lba0[off + layout::TYPE_BYTE];
         if type_byte != types::EMPTY {
             nonempty += 1;
             if type_byte != TYPE_GPT_PROTECTIVE {
@@ -89,10 +118,10 @@ pub const STATUS_ACTIVE: u8 = 0x80;
 /// entries are reported as-is — chain walking is not yet implemented.
 pub fn parse(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
     let mut out = Vec::new();
-    for i in 0..4 {
-        let off = 446 + i * 16;
+    for i in 0..layout::ENTRY_COUNT {
+        let off = layout::entry_at(i);
         let status = lba0[off];
-        let type_byte = lba0[off + 4];
+        let type_byte = lba0[off + layout::TYPE_BYTE];
         if type_byte == types::EMPTY {
             continue;
         }
@@ -163,7 +192,7 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
 
     let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
     for (i, p) in partitions.iter().enumerate() {
-        let off = 446 + i * 16;
+        let off = layout::entry_at(i);
         let (type_byte, active) = match p.kind {
             PartitionKind::Mbr { type_byte, active } => (type_byte, active),
             _ => return Err(Error::Invalid("non-MBR partition kind in MBR write")),
@@ -175,9 +204,11 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
         // CHS first/last left as zeros — modern OSes ignore CHS once LBA is
         // present, and the legacy fields can't faithfully describe most
         // modern geometry anyway.
-        sector[off + 4] = type_byte;
-        sector[off + 8..off + 12].copy_from_slice(&start_lba.to_le_bytes());
-        sector[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
+        sector[off + layout::TYPE_BYTE] = type_byte;
+        sector[off + layout::START_LBA..off + layout::START_LBA + 4]
+            .copy_from_slice(&start_lba.to_le_bytes());
+        sector[off + layout::SECTOR_COUNT..off + layout::SECTOR_COUNT + 4]
+            .copy_from_slice(&sectors.to_le_bytes());
     }
     sector[510] = 0x55;
     sector[511] = 0xAA;

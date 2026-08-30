@@ -22,13 +22,41 @@ predates the work; this is the current position. Updated 2026-08-30.
 consumer compiled against that header read every field after the short one from
 the wrong offset.
 
-### H2, H3, H4 — GPT and MBR offsets transcribed by hand in three, five and two places — **fixable, not yet done**
+### H2, H3, H4 — GPT and MBR layouts transcribed by hand — **fixed**
 
-All three are the same change: one description of each on-disk layout instead of
-several agreeing by hand. H4 is the sharpest — GPT geometry derived two
-different ways that agree only because someone checked.
+**H4 was the sharpest and the probe proved it.** `gpt_write` derived its
+geometry (`FIRST_USABLE_LBA = 2 + ENTRY_ARRAY_SECTORS`) while `mutation` wrote
+`34` and `33` as literals. They agreed only because somebody checked — and
+setting `mutation`'s to 40 left **the whole suite green**, leaving a writer and a
+planner that disagree about where a partition may start.
 
-Deferred as one change with the round-trip tests as the contract.
+`gpt_layout` in `lib.rs` derives all of it from the pinned entry count, and both
+modules import it.
+
+**H2.** The GPT header was transcribed in `gpt::parse_header` and again in
+`gpt_write::build_header` — two descriptions of one layout, agreeing because
+both were written from the same table on the same afternoon. A wrong offset in
+either produces a header the other half of this crate cannot read.
+`gpt::header_offsets` names all thirteen.
+
+**H3.** `446 + i * 16` at three sites and the per-entry field offsets at two
+more. `mbr::layout` names them, with `entry_at(i)` for the arithmetic.
+
+Three tests, and they check relationships rather than restating numbers: the
+array is the entries laid out; first-usable is the protective MBR plus the header
+plus the array; the four MBR entries end exactly where the boot signature begins;
+and every named GPT field fits inside the 92 bytes the CRC covers.
+
+| mutation | tests failing (was) |
+|---|---|
+| `FIRST_USABLE_LBA` typed as 40 | 2 (**0**) |
+| `NUM_ENTRIES` halved | 2 |
+| `TABLE_START` 446 → 440 | 3 |
+
+### M8 — `div_ceil` hand-rolled beside real `div_ceil` calls — **fixed**
+
+`byte / SECTOR_SIZE + if byte % SECTOR_SIZE != 0 { 1 } else { 0 }`, three lines
+from a `div_ceil` call, in a file that uses the real one elsewhere.
 
 ### H5 — LBA-to-byte arithmetic on untrusted header values was unchecked — **fixed**
 
@@ -117,16 +145,16 @@ rather than of the consistency between copies:
 That last row is why the new tests exist: the second spelling is the one thing
 nothing else in the crate could notice drifting.
 
-### M3, M4, M7, M8, M11 — duplication and unnamed values — **fixable, not yet done**
+### M3, M4, M7, M11 — duplication and unnamed values — **fixable, not yet done**
 
 The overlap check four times; no LBA accessors so the conversion is open-coded
-seven times; the test block device reimplemented four times; `div_ceil`
-hand-rolled beside real `div_ceil` calls; `sniff`'s magic offsets half-named.
+seven times; the test block device reimplemented four times; `sniff`'s magic
+offsets half-named.
 
 ---
 
 ## Verification
 
-51 tests pass, up from 49. `chore lint` clean. The only behavioural
+54 tests pass, up from 51. `chore lint` clean. The only behavioural
 change is H5: a GPT entry whose LBAs overflow a byte offset is now refused
 rather than wrapping.

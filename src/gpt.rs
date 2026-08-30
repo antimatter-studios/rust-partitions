@@ -55,6 +55,42 @@ pub const SIGNATURE: &[u8; 8] = b"EFI PART";
 /// is [`crate::SECTOR_SIZE`].
 pub use crate::SECTOR_SIZE;
 
+/// Byte offsets within the 92-byte GPT header.
+///
+/// The header was transcribed by hand in `gpt::parse_header` and again
+/// in `gpt_write::build_header` — two descriptions of one layout,
+/// agreeing only because both were written from the same table on the
+/// same afternoon. A wrong offset in either produces a header the other
+/// half of this crate cannot read.
+pub mod header_offsets {
+    /// `Signature` — `EFI PART`.
+    pub const SIGNATURE: usize = 0;
+    /// `Revision`.
+    pub const REVISION: usize = 8;
+    /// `HeaderSize`.
+    pub const HEADER_SIZE: usize = 12;
+    /// `HeaderCRC32`, computed with these four bytes zeroed.
+    pub const HEADER_CRC32: usize = 16;
+    /// `MyLBA` — the LBA this header itself sits at.
+    pub const MY_LBA: usize = 24;
+    /// `AlternateLBA` — where the other copy sits.
+    pub const ALTERNATE_LBA: usize = 32;
+    /// `FirstUsableLBA`.
+    pub const FIRST_USABLE_LBA: usize = 40;
+    /// `LastUsableLBA`.
+    pub const LAST_USABLE_LBA: usize = 48;
+    /// `DiskGUID`.
+    pub const DISK_GUID: usize = 56;
+    /// `PartitionEntryLBA`.
+    pub const PARTITION_ENTRY_LBA: usize = 72;
+    /// `NumberOfPartitionEntries`.
+    pub const NUM_PARTITION_ENTRIES: usize = 80;
+    /// `SizeOfPartitionEntry`.
+    pub const PARTITION_ENTRY_SIZE: usize = 84;
+    /// `PartitionEntryArrayCRC32`.
+    pub const PARTITION_ENTRY_ARRAY_CRC32: usize = 88;
+}
+
 /// Named bits inside the 64-bit partition attributes field (entry offset
 /// +48). Bits 0..47 are defined by the partition-table spec; bits 48..63 are
 /// reserved for "partition-type-specific" use and are commonly hijacked by
@@ -148,7 +184,7 @@ pub struct Header {
 
 /// Parse and CRC-validate a GPT header sector. Does not touch the entry array.
 pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
-    if &sector[0..8] != SIGNATURE {
+    if &sector[header_offsets::SIGNATURE..header_offsets::SIGNATURE + 8] != SIGNATURE {
         return Err(Error::GptCorrupt("missing EFI PART signature"));
     }
     let header_size = u32::from_le_bytes(sector[12..16].try_into().unwrap());
@@ -156,24 +192,57 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
         return Err(Error::GptCorrupt("header_size out of range"));
     }
 
-    let stored_header_crc = u32::from_le_bytes(sector[16..20].try_into().unwrap());
+    let stored_header_crc = u32::from_le_bytes(
+        sector[header_offsets::HEADER_CRC32..header_offsets::HEADER_CRC32 + 4]
+            .try_into()
+            .unwrap(),
+    );
     let mut header_for_crc = [0u8; crate::SECTOR_SIZE_USIZE];
     header_for_crc[..header_size as usize].copy_from_slice(&sector[..header_size as usize]);
-    header_for_crc[16..20].fill(0);
+    header_for_crc[header_offsets::HEADER_CRC32..header_offsets::HEADER_CRC32 + 4].fill(0);
     let computed_header_crc = crc32fast::hash(&header_for_crc[..header_size as usize]);
     if computed_header_crc != stored_header_crc {
         return Err(Error::GptHeaderCrc);
     }
 
-    let my_lba = u64::from_le_bytes(sector[24..32].try_into().unwrap());
-    let alternate_lba = u64::from_le_bytes(sector[32..40].try_into().unwrap());
-    let first_usable_lba = u64::from_le_bytes(sector[40..48].try_into().unwrap());
+    let my_lba = u64::from_le_bytes(
+        sector[header_offsets::MY_LBA..header_offsets::MY_LBA + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let alternate_lba = u64::from_le_bytes(
+        sector[header_offsets::ALTERNATE_LBA..header_offsets::ALTERNATE_LBA + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let first_usable_lba = u64::from_le_bytes(
+        sector[header_offsets::FIRST_USABLE_LBA..header_offsets::FIRST_USABLE_LBA + 8]
+            .try_into()
+            .unwrap(),
+    );
     let last_usable_lba = u64::from_le_bytes(sector[48..56].try_into().unwrap());
     let disk_guid: [u8; 16] = sector[56..72].try_into().unwrap();
-    let partition_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap());
-    let num_partition_entries = u32::from_le_bytes(sector[80..84].try_into().unwrap());
-    let partition_entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap());
-    let partition_entry_array_crc32 = u32::from_le_bytes(sector[88..92].try_into().unwrap());
+    let partition_entry_lba = u64::from_le_bytes(
+        sector[header_offsets::PARTITION_ENTRY_LBA..header_offsets::PARTITION_ENTRY_LBA + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let num_partition_entries = u32::from_le_bytes(
+        sector[header_offsets::NUM_PARTITION_ENTRIES..header_offsets::NUM_PARTITION_ENTRIES + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let partition_entry_size = u32::from_le_bytes(
+        sector[header_offsets::PARTITION_ENTRY_SIZE..header_offsets::PARTITION_ENTRY_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let partition_entry_array_crc32 = u32::from_le_bytes(
+        sector[header_offsets::PARTITION_ENTRY_ARRAY_CRC32
+            ..header_offsets::PARTITION_ENTRY_ARRAY_CRC32 + 4]
+            .try_into()
+            .unwrap(),
+    );
 
     if !(128..=4096).contains(&partition_entry_size) {
         return Err(Error::GptCorrupt("partition_entry_size out of range"));

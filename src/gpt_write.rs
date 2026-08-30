@@ -26,14 +26,11 @@ use crate::gpt::{type_guids, SECTOR_SIZE, SIGNATURE};
 use crate::probe::{Partition, PartitionKind};
 use fs_core::BlockDevice;
 
-/// Canonical entry counts. The spec allows other values; this writer pins
-/// them so every commit produces a byte-identical layout shape.
-const NUM_ENTRIES: u32 = 128;
-const ENTRY_SIZE: u32 = 128;
-const ENTRY_ARRAY_BYTES: u64 = (NUM_ENTRIES as u64) * (ENTRY_SIZE as u64); // 16384
-const ENTRY_ARRAY_SECTORS: u64 = ENTRY_ARRAY_BYTES / SECTOR_SIZE; // 32
-const FIRST_USABLE_LBA: u64 = 2 + ENTRY_ARRAY_SECTORS; // 34
-const HEADER_SIZE: u32 = 92;
+use crate::gpt;
+use crate::gpt_layout::{
+    ENTRY_ARRAY_SECTORS, ENTRY_SIZE, FIRST_USABLE_LBA, HEADER_SIZE, NUM_ENTRIES,
+};
+const ENTRY_ARRAY_BYTES: u64 = (NUM_ENTRIES as u64) * (ENTRY_SIZE as u64);
 
 /// Write a complete GPT to `dev`. The caller owns the partition list and the
 /// disk GUID; this function does not mutate either.
@@ -219,14 +216,18 @@ fn build_header(
     h[12..16].copy_from_slice(&HEADER_SIZE.to_le_bytes());
     // 16..20 header_crc — left zero for the compute pass, written below.
     // 20..24 reserved
-    h[24..32].copy_from_slice(&my_lba.to_le_bytes());
+    h[gpt::header_offsets::MY_LBA..gpt::header_offsets::MY_LBA + 8]
+        .copy_from_slice(&my_lba.to_le_bytes());
     h[32..40].copy_from_slice(&alternate_lba.to_le_bytes());
     h[40..48].copy_from_slice(&first_usable.to_le_bytes());
     h[48..56].copy_from_slice(&last_usable.to_le_bytes());
     h[56..72].copy_from_slice(&disk_guid);
-    h[72..80].copy_from_slice(&entry_lba.to_le_bytes());
-    h[80..84].copy_from_slice(&NUM_ENTRIES.to_le_bytes());
-    h[84..88].copy_from_slice(&ENTRY_SIZE.to_le_bytes());
+    h[gpt::header_offsets::PARTITION_ENTRY_LBA..gpt::header_offsets::PARTITION_ENTRY_LBA + 8]
+        .copy_from_slice(&entry_lba.to_le_bytes());
+    h[gpt::header_offsets::NUM_PARTITION_ENTRIES..gpt::header_offsets::NUM_PARTITION_ENTRIES + 4]
+        .copy_from_slice(&NUM_ENTRIES.to_le_bytes());
+    h[gpt::header_offsets::PARTITION_ENTRY_SIZE..gpt::header_offsets::PARTITION_ENTRY_SIZE + 4]
+        .copy_from_slice(&ENTRY_SIZE.to_le_bytes());
     h[88..92].copy_from_slice(&entry_array_crc.to_le_bytes());
 
     let header_crc = crc32fast::hash(&h[..HEADER_SIZE as usize]);

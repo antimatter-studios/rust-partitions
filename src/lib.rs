@@ -38,6 +38,40 @@ pub const SECTOR_SIZE_USIZE: usize = SECTOR_SIZE as usize;
 /// here for signatures that want to name the type.
 pub type Sector = [u8; SECTOR_SIZE_USIZE];
 
+/// The GPT layout this crate reads and writes.
+///
+/// Every number here was previously stated twice: `gpt_write` derived
+/// its geometry from the entry array, `mutation` wrote `34` and `33` as
+/// literals, and the two agreed only because somebody checked. Changing
+/// either alone produced a writer and a planner that disagreed about
+/// where a partition may start — and **no test noticed**: setting
+/// `mutation`'s first-usable LBA to 40 left the whole suite green.
+pub mod gpt_layout {
+    use super::SECTOR_SIZE;
+
+    /// Entries in the partition array. The spec allows other values;
+    /// this crate pins one so every commit produces the same shape.
+    pub const NUM_ENTRIES: u32 = 128;
+    /// Bytes per entry, likewise pinned.
+    pub const ENTRY_SIZE: u32 = 128;
+    /// Sectors the entry array occupies.
+    pub const ENTRY_ARRAY_SECTORS: u64 = (NUM_ENTRIES as u64) * (ENTRY_SIZE as u64) / SECTOR_SIZE;
+
+    /// First LBA a partition may occupy: the protective MBR, the
+    /// primary header, and the entry array.
+    ///
+    /// Derived rather than written as `34`, so it stays correct if the
+    /// pinned entry count ever changes.
+    pub const FIRST_USABLE_LBA: u64 = 2 + ENTRY_ARRAY_SECTORS;
+
+    /// Sectors reserved at the end of the disk: the backup entry array
+    /// and the backup header.
+    pub const BACKUP_RESERVE_SECTORS: u64 = ENTRY_ARRAY_SECTORS + 1;
+
+    /// Bytes of the GPT header that the header CRC covers.
+    pub const HEADER_SIZE: u32 = 92;
+}
+
 /// The largest LBA an MBR entry can name.
 ///
 /// MBR LBAs are 32-bit, so one primary entry describes at most
@@ -71,6 +105,89 @@ pub use fs_core::{BlockDevice, BlockRead, FileDevice as FileBlock, OwnedSlice, S
 #[cfg(test)]
 mod sector_size_tests {
     use super::*;
+
+    /// The GPT geometry is derived from the entry array, not typed.
+    ///
+    /// `gpt_write` computed it and `mutation` wrote `34` and `33` as
+    /// literals. They agreed only because somebody checked — and
+    /// **nothing would have noticed if they stopped**: setting
+    /// `mutation`'s first-usable LBA to 40 left the whole suite green,
+    /// leaving a writer and a planner that disagree about where a
+    /// partition may start.
+    #[test]
+    fn the_gpt_geometry_follows_from_the_entry_array() {
+        use gpt_layout::*;
+        assert_eq!(
+            ENTRY_ARRAY_SECTORS,
+            u64::from(NUM_ENTRIES) * u64::from(ENTRY_SIZE) / SECTOR_SIZE,
+            "the array is the entries, laid out"
+        );
+        assert_eq!(
+            FIRST_USABLE_LBA,
+            2 + ENTRY_ARRAY_SECTORS,
+            "protective MBR + primary header + the array"
+        );
+        assert_eq!(
+            BACKUP_RESERVE_SECTORS,
+            ENTRY_ARRAY_SECTORS + 1,
+            "the backup array + the backup header"
+        );
+        // And the values the spec's common case produces, so a change
+        // to the pinned entry count is visible rather than silent.
+        assert_eq!(
+            (
+                ENTRY_ARRAY_SECTORS,
+                FIRST_USABLE_LBA,
+                BACKUP_RESERVE_SECTORS
+            ),
+            (32, 34, 33)
+        );
+    }
+
+    /// The MBR table is four 16-byte entries after 446 bytes of code.
+    #[test]
+    fn the_mbr_table_starts_where_the_bootloader_ends() {
+        use mbr::layout::*;
+        assert_eq!(TABLE_START, 446);
+        assert_eq!(ENTRY_SIZE, 16);
+        assert_eq!(ENTRY_COUNT, 4);
+        assert_eq!(entry_at(0), 446);
+        assert_eq!(entry_at(3), 446 + 3 * 16);
+        // The four entries end exactly at the 0x55AA signature.
+        assert_eq!(
+            entry_at(ENTRY_COUNT - 1) + ENTRY_SIZE,
+            SECTOR_SIZE_USIZE - 2,
+            "the table must end where the boot signature begins"
+        );
+    }
+
+    /// Every GPT header field lies inside the CRC'd region.
+    #[test]
+    fn the_gpt_header_fields_fit_inside_the_header() {
+        use gpt::header_offsets::*;
+        for (name, off, len) in [
+            ("signature", SIGNATURE, 8),
+            ("revision", REVISION, 4),
+            ("header_size", HEADER_SIZE, 4),
+            ("header_crc32", HEADER_CRC32, 4),
+            ("my_lba", MY_LBA, 8),
+            ("alternate_lba", ALTERNATE_LBA, 8),
+            ("first_usable_lba", FIRST_USABLE_LBA, 8),
+            ("last_usable_lba", LAST_USABLE_LBA, 8),
+            ("disk_guid", DISK_GUID, 16),
+            ("partition_entry_lba", PARTITION_ENTRY_LBA, 8),
+            ("num_partition_entries", NUM_PARTITION_ENTRIES, 4),
+            ("partition_entry_size", PARTITION_ENTRY_SIZE, 4),
+            ("array_crc32", PARTITION_ENTRY_ARRAY_CRC32, 4),
+        ] {
+            assert!(
+                off + len <= gpt_layout::HEADER_SIZE as usize,
+                "{name} at {off}..{} runs past the {}-byte header",
+                off + len,
+                gpt_layout::HEADER_SIZE
+            );
+        }
+    }
 
     /// The two spellings of one number cannot drift.
     ///
