@@ -22,12 +22,12 @@ use fs_core::{BlockDevice, BlockRead};
 /// which describes the 128 that is one term of this sum, not the sum.
 const GPT_FIRST_USABLE_LBA: u64 = 34;
 const GPT_BACKUP_RESERVE_SECTORS: u64 = 33; // entry array (32) + backup header (1)
-const SECTOR_SIZE: u64 = 512;
+use crate::SECTOR_SIZE;
 /// 1 MiB alignment in 512-byte sectors. Most partition-table editors use
 /// this as the default and Windows / macOS treat it as a soft requirement.
 const ALIGNMENT_SECTORS: u64 = 2048;
 /// MBR LBAs are 32-bit. Cap any computed range at this.
-const MBR_LBA_MAX: u64 = 0xFFFF_FFFF;
+use crate::MBR_LBA_MAX;
 
 /// Cross-table-format identifier for "what kind of partition is this?". The
 /// caller picks a logical role and the mutation API translates it to the
@@ -110,7 +110,7 @@ impl PartitionSet {
         let disk_size = dev.size_bytes();
         let disk_guid = if table_kind == TableKind::Gpt {
             // Re-read LBA 1 to pull the disk GUID out.
-            let mut sector = [0u8; 512];
+            let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
             dev.read_at(SECTOR_SIZE, &mut sector)?;
             gpt::parse_header(&sector)?.disk_guid
         } else {

@@ -84,8 +84,8 @@ impl Partition {
 ///     error rather than reporting a single GPT-protective MBR partition.
 pub fn probe(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>)> {
     // --- LBA 0 + LBA 1: enough to decide which table type ---
-    let mut lba0 = [0u8; 512];
-    let mut lba1 = [0u8; 512];
+    let mut lba0 = [0u8; crate::SECTOR_SIZE_USIZE];
+    let mut lba1 = [0u8; crate::SECTOR_SIZE_USIZE];
     dev.read_at(0, &mut lba0)?;
     if dev.size_bytes() >= 1024 {
         dev.read_at(512, &mut lba1)?;

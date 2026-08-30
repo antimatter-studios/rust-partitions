@@ -51,7 +51,9 @@ use crate::probe::{Partition, PartitionKind};
 use crate::BlockRead;
 
 pub const SIGNATURE: &[u8; 8] = b"EFI PART";
-pub const SECTOR_SIZE: u64 = 512;
+/// Re-exported so `gpt::SECTOR_SIZE` keeps working; the definition
+/// is [`crate::SECTOR_SIZE`].
+pub use crate::SECTOR_SIZE;
 
 /// Named bits inside the 64-bit partition attributes field (entry offset
 /// +48). Bits 0..47 are defined by the partition-table spec; bits 48..63 are
@@ -145,7 +147,7 @@ pub struct Header {
 }
 
 /// Parse and CRC-validate a GPT header sector. Does not touch the entry array.
-pub fn parse_header(sector: &[u8; 512]) -> Result<Header> {
+pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
     if &sector[0..8] != SIGNATURE {
         return Err(Error::GptCorrupt("missing EFI PART signature"));
     }
@@ -155,7 +157,7 @@ pub fn parse_header(sector: &[u8; 512]) -> Result<Header> {
     }
 
     let stored_header_crc = u32::from_le_bytes(sector[16..20].try_into().unwrap());
-    let mut header_for_crc = [0u8; 512];
+    let mut header_for_crc = [0u8; crate::SECTOR_SIZE_USIZE];
     header_for_crc[..header_size as usize].copy_from_slice(&sector[..header_size as usize]);
     header_for_crc[16..20].fill(0);
     let computed_header_crc = crc32fast::hash(&header_for_crc[..header_size as usize]);
@@ -257,7 +259,7 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
 
 /// Parse the GPT given the LBA-1 sector and a device for fetching the entry
 /// array. Validates header CRC and entry-array CRC.
-pub fn parse(dev: &dyn BlockRead, lba1: &[u8; 512]) -> Result<Vec<Partition>> {
+pub fn parse(dev: &dyn BlockRead, lba1: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
     let header = parse_header(lba1)?;
     let (parts, _) = parse_entry_array(dev, &header)?;
     Ok(parts)
@@ -290,7 +292,7 @@ pub fn parse_backup(dev: &dyn BlockRead) -> Result<Vec<Partition>> {
         return Err(Error::GptCorrupt("device too small for GPT backup"));
     }
     let last_lba = total / SECTOR_SIZE - 1;
-    let mut sector = [0u8; 512];
+    let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
     dev.read_at(last_lba * SECTOR_SIZE, &mut sector)?;
     let header = parse_header(&sector)?;
     if header.my_lba != last_lba {

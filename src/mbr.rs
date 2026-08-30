@@ -27,11 +27,8 @@ use crate::error::{Error, Result};
 use crate::probe::{Partition, PartitionKind};
 use fs_core::BlockDevice;
 
-const SECTOR_SIZE: u64 = 512;
-/// MBR LBAs are 32-bit, so a single primary entry can describe at most
-/// 2^32 - 1 sectors = 2 TiB - 512 B at 512-byte sectors. The writer rejects
-/// anything that doesn't fit.
-const MBR_LBA_MAX: u64 = 0xFFFF_FFFF;
+use crate::MBR_LBA_MAX;
+use crate::SECTOR_SIZE;
 
 /// One 0xEE entry that spans the whole disk = protective MBR (GPT lives here).
 ///
@@ -67,7 +64,7 @@ pub mod types {
 
 /// True when the MBR is "protective" — exactly one non-empty entry of type
 /// 0xEE. Real GPT lives at LBA 1 in this case.
-pub fn is_protective(lba0: &[u8; 512]) -> bool {
+pub fn is_protective(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> bool {
     let mut nonempty = 0;
     let mut all_protective = true;
     for i in 0..4 {
@@ -90,7 +87,7 @@ pub const STATUS_ACTIVE: u8 = 0x80;
 
 /// Parse the four primary entries. Empty entries are skipped. Extended-LBA
 /// entries are reported as-is — chain walking is not yet implemented.
-pub fn parse(lba0: &[u8; 512]) -> Result<Vec<Partition>> {
+pub fn parse(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
     let mut out = Vec::new();
     for i in 0..4 {
         let off = 446 + i * 16;
@@ -164,7 +161,7 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
         prev_end_lba = Some(end_lba);
     }
 
-    let mut sector = [0u8; 512];
+    let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
     for (i, p) in partitions.iter().enumerate() {
         let off = 446 + i * 16;
         let (type_byte, active) = match p.kind {

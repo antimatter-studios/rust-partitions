@@ -85,21 +85,48 @@ Clear-cut on the face of it, but `ffi_guard` returns a code and these return
 pointers — the same shape as `am-fs-core`'s M1. Fixing it properly means adding
 a pointer-returning guard to `fs-core`, which is a change to another crate.
 
-### M3, M4, M5, M7, M8, M11 — duplication and unnamed values — **fixable, not yet done**
+### M5 — `SECTOR_SIZE` defined three times and then ignored eight — **fixed**
+
+`gpt`, `mbr` and `mutation` each declared `SECTOR_SIZE: u64 = 512`, and eight
+more places wrote the literal anyway — because Rust will not take a `u64` const
+as an array length, which is exactly the reason to add a second spelling rather
+than repeat the number. `MBR_LBA_MAX` was declared twice, with a third bare
+`0xFFFF_FFFF` in `gpt_write`'s protective-MBR sizing.
+
+One definition each, in `lib.rs`, plus `SECTOR_SIZE_USIZE` for array lengths and
+a `Sector` alias for signatures that want to name the type. The five
+`[u8; 512]` signatures moved too, so nothing in the crate states the number
+twice.
+
+**Checked before as well as after.** Before, mutating any one of the three
+`SECTOR_SIZE` declarations failed 3 tests, and `MBR_LBA_MAX` the same — so this
+was a genuine tidy-up with no coverage hole behind it, which is worth
+establishing, since several other duplications in this family turned out to be
+hiding one.
+
+After, the guard changes shape. With one definition the crate can no longer
+disagree with *itself*, so a wrong value has to be caught by a test of the value
+rather than of the consistency between copies:
+
+| mutation | tests failing |
+|---|---|
+| `SECTOR_SIZE` 512 → 4096 | 2 — a probe round-trip, and the 2 TiB ceiling relation |
+| `MBR_LBA_MAX` truncated to `0xFFFF` | 2 |
+| `SECTOR_SIZE_USIZE` disagreeing with `SECTOR_SIZE` | 2 |
+
+That last row is why the new tests exist: the second spelling is the one thing
+nothing else in the crate could notice drifting.
+
+### M3, M4, M7, M8, M11 — duplication and unnamed values — **fixable, not yet done**
 
 The overlap check four times; no LBA accessors so the conversion is open-coded
-seven times; `SECTOR_SIZE` defined three times then ignored eight; the test
-block device reimplemented four times; `div_ceil` hand-rolled beside real
-`div_ceil` calls; `sniff`'s magic offsets half-named.
-
-One deduplication change, with M5 first — three definitions of a sector size
-that eight sites then ignore is the one most likely to end in an actual
-disagreement.
+seven times; the test block device reimplemented four times; `div_ceil`
+hand-rolled beside real `div_ceil` calls; `sniff`'s magic offsets half-named.
 
 ---
 
 ## Verification
 
-49 tests pass, unchanged in number. `chore lint` clean. The only behavioural
+51 tests pass, up from 49. `chore lint` clean. The only behavioural
 change is H5: a GPT entry whose LBAs overflow a byte offset is now refused
 rather than wrapping.
