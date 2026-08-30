@@ -15,7 +15,11 @@ use crate::mbr::{self, types as mbr_types};
 use crate::probe::{Partition, PartitionKind, TableKind};
 use fs_core::{BlockDevice, BlockRead};
 
-/// Spec-mandated GPT slot count.
+/// First LBA a partition may occupy: the protective MBR (1) + the GPT
+/// header (1) + the 128-slot entry array (32).
+///
+/// The doc that used to sit here said "spec-mandated GPT slot count",
+/// which describes the 128 that is one term of this sum, not the sum.
 const GPT_FIRST_USABLE_LBA: u64 = 34;
 const GPT_BACKUP_RESERVE_SECTORS: u64 = 33; // entry array (32) + backup header (1)
 const SECTOR_SIZE: u64 = 512;

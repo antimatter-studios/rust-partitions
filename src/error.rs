@@ -17,12 +17,24 @@ pub enum Error {
     GptEntriesCrc,
     /// GPT header field combination is internally inconsistent.
     GptCorrupt(&'static str),
-    /// MBR signature missing or extended-partition chain broken.
+    /// Reserved. Never constructed.
+    ///
+    /// The doc used to read "MBR signature missing or extended-partition
+    /// chain broken", and neither happens here: a missing signature
+    /// returns [`Error::NoPartitionTable`], and extended chains are not
+    /// implemented. Kept because it is `pub` and published, so removing
+    /// it would break a consumer matching on it.
     MbrCorrupt(&'static str),
-    /// GPT primary header and backup header disagree on the partition list,
-    /// header fields, or entry-array CRC. Carries a short reason string. The
-    /// probe path treats this as advisory by default — the variant only
-    /// surfaces if a caller explicitly asks for backup validation.
+    /// Reserved. Never constructed.
+    ///
+    /// The doc used to describe an opt-in backup-validation mode — "the
+    /// variant only surfaces if a caller explicitly asks" — and there is
+    /// no such option: nothing compares the primary and backup headers.
+    /// A reader looking for that feature would have gone hunting for an
+    /// argument that does not exist.
+    ///
+    /// Kept because it is `pub` and published. It is the variant to use
+    /// if backup validation is added.
     GptBackupMismatch(&'static str),
     /// Mutation API rejected an input: overlap, out-of-bounds, alignment
     /// impossible, etc. Carries a short reason string.
