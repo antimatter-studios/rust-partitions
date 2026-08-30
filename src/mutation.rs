@@ -20,8 +20,9 @@ use fs_core::{BlockDevice, BlockRead};
 ///
 /// The doc that used to sit here said "spec-mandated GPT slot count",
 /// which describes the 128 that is one term of this sum, not the sum.
-const GPT_FIRST_USABLE_LBA: u64 = 34;
-const GPT_BACKUP_RESERVE_SECTORS: u64 = 33; // entry array (32) + backup header (1)
+use crate::gpt_layout::{
+    BACKUP_RESERVE_SECTORS as GPT_BACKUP_RESERVE_SECTORS, FIRST_USABLE_LBA as GPT_FIRST_USABLE_LBA,
+};
 use crate::SECTOR_SIZE;
 /// 1 MiB alignment in 512-byte sectors. Most partition-table editors use
 /// this as the default and Windows / macOS treat it as a soft requirement.
@@ -181,7 +182,7 @@ impl PartitionSet {
 
         let start_lba = match start_hint {
             Some(byte) => {
-                let raw_sectors = byte / SECTOR_SIZE + if byte % SECTOR_SIZE != 0 { 1 } else { 0 };
+                let raw_sectors = byte.div_ceil(SECTOR_SIZE);
                 let aligned = align_up(raw_sectors.max(first_usable_lba), ALIGNMENT_SECTORS);
                 if aligned < first_usable_lba {
                     return Err(Error::Invalid("hinted start before first usable LBA"));
