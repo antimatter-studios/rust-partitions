@@ -119,7 +119,7 @@ pub fn write_gpt(
     let entry_array_crc = crc32fast::hash(&array);
 
     // --- Protective MBR at LBA 0. ---
-    let mut mbr = [0u8; 512];
+    let mut mbr = [0u8; crate::SECTOR_SIZE_USIZE];
     // Partition 1 (offset 446): 0xEE spanning the disk.
     mbr[446] = 0x00; // boot indicator
                      // CHS first sector — write the canonical 0x00 0x02 0x00 trio meaning
@@ -137,7 +137,7 @@ pub fn write_gpt(
     mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
     // size in sectors = min(disk_sectors - 1, 0xFFFFFFFF). Per the spec, the
     // protective entry caps at 0xFFFFFFFF for >2 TiB devices.
-    let prot_sectors = (total_sectors - 1).min(0xFFFF_FFFF) as u32;
+    let prot_sectors = (total_sectors - 1).min(crate::MBR_LBA_MAX) as u32;
     mbr[458..462].copy_from_slice(&prot_sectors.to_le_bytes());
     // boot signature
     mbr[510] = 0x55;
@@ -212,8 +212,8 @@ fn build_header(
     last_usable: u64,
     disk_guid: [u8; 16],
     entry_array_crc: u32,
-) -> [u8; 512] {
-    let mut h = [0u8; 512];
+) -> [u8; crate::SECTOR_SIZE_USIZE] {
+    let mut h = [0u8; crate::SECTOR_SIZE_USIZE];
     h[0..8].copy_from_slice(SIGNATURE);
     h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // revision 1.0
     h[12..16].copy_from_slice(&HEADER_SIZE.to_le_bytes());
