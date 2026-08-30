@@ -127,9 +127,9 @@ pub fn write_gpt(
     mbr[447] = 0x00;
     mbr[448] = 0x02;
     mbr[449] = 0x00;
-    mbr[450] = 0xEE; // type byte
-                     // CHS last sector — set to 0xFF 0xFF 0xFF (max) per the legacy convention
-                     // when the LBA range exceeds what CHS can express.
+    mbr[450] = crate::mbr::types::GPT_PROTECTIVE;
+    // CHS last sector — set to 0xFF 0xFF 0xFF (max) per the legacy convention
+    // when the LBA range exceeds what CHS can express.
     mbr[451] = 0xFF;
     mbr[452] = 0xFF;
     mbr[453] = 0xFF;

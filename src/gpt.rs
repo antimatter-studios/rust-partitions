@@ -221,8 +221,22 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
             return Err(Error::GptCorrupt("ending_lba < starting_lba"));
         }
         let attributes = u64::from_le_bytes(array[off + 48..off + 56].try_into().unwrap());
-        let start = start_lba * SECTOR_SIZE;
-        let length = (end_lba - start_lba + 1) * SECTOR_SIZE;
+
+        // Checked. Both LBAs come straight off the disk and the only
+        // guard above is their relative ordering, so either
+        // multiplication can overflow a u64 — a panic in debug, a silent
+        // wrap in release, which is the worse of the two: a wrapped
+        // `start` names a byte offset the caller then reads from.
+        let start = start_lba
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::GptCorrupt("starting_lba overflows a byte offset"))?;
+        let sectors = end_lba
+            .checked_sub(start_lba)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::GptCorrupt("partition sector count overflows"))?;
+        let length = sectors
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::GptCorrupt("partition length overflows a byte count"))?;
 
         let name_bytes = &array[off + 56..off + 128];
         let label = parse_utf16_label(name_bytes);

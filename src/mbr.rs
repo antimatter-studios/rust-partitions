@@ -34,7 +34,12 @@ const SECTOR_SIZE: u64 = 512;
 const MBR_LBA_MAX: u64 = 0xFFFF_FFFF;
 
 /// One 0xEE entry that spans the whole disk = protective MBR (GPT lives here).
-pub const TYPE_GPT_PROTECTIVE: u8 = 0xEE;
+///
+/// The same byte as [`types::GPT_PROTECTIVE`], which is the spelling
+/// callers are meant to match on; this one is what the module's own
+/// `is_protective` uses. Kept as an alias rather than removed because
+/// both are `pub` and published.
+pub const TYPE_GPT_PROTECTIVE: u8 = types::GPT_PROTECTIVE;
 
 /// Common MBR partition-type byte values, exported so callers can match.
 pub mod types {
