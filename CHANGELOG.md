@@ -6,6 +6,20 @@ never does.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-06
+
+### Fixed
+
+- A partition table's own numbers no longer drive unchecked arithmetic.
+  A GPT entry states a first and a last LBA, and both come off the disk;
+  multiplying them out to a byte range could wrap in the release
+  profile, where overflow-checks is off.
+- An oversized partition is clamped to the device rather than refused.
+  A table that describes a partition running past the end of the device
+  it is on is ordinary — an image truncated after the fact has one — and
+  refusing the whole table made the disk unreadable when the partition
+  before it was intact.
+
 ## [0.4.0] — 2026-09-04
 
 ### Changed
