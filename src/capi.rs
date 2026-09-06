@@ -367,13 +367,13 @@ pub unsafe extern "C" fn partitions_open_slice(
             return ptr::null_mut();
         }
         let raw = &l.entries[index].raw;
-        if !slice_fits(l.parent.size_bytes(), raw.start, raw.length) {
+        let Some(length) = slice_on_device(l.parent.size_bytes(), raw.start, raw.length) else {
             set_last_error(
-                "partitions_open_slice: the partition reaches past the end of the device",
+                "partitions_open_slice: the partition begins past the end of the device",
             );
             return ptr::null_mut();
-        }
-        let slice = OwnedSlice::new(l.parent.clone(), raw.start, raw.length);
+        };
+        let slice = OwnedSlice::new(l.parent.clone(), raw.start, length);
         FsCoreDevice::into_handle(Arc::new(slice))
     }));
     res.unwrap_or_else(|_| {
@@ -382,20 +382,29 @@ pub unsafe extern "C" fn partitions_open_slice(
     })
 }
 
-/// Whether a partition is somewhere the device actually goes.
+/// How much of a partition is actually on the device.
 ///
 /// A partition table is bytes off the disk, so a partition that claims
-/// to start or end past the device is an ordinary thing to be handed.
-/// `probe` reports it, because what the table says is worth showing
-/// even when it is wrong -- but a slice built on it would tell whatever
-/// filesystem driver is stacked on it that it has more device than
-/// exists, and that driver would size its own structures from the
-/// answer.
-fn slice_fits(parent_size: u64, start: u64, length: u64) -> bool {
-    match start.checked_add(length) {
-        Some(end) => end <= parent_size,
-        None => false,
+/// to start or end past the device is an ordinary thing to be handed --
+/// and not only from a hostile image. A `dd` of the first N gigabytes
+/// of a disk, or a table left stale after the volume was shrunk, both
+/// produce a last partition that runs off the end.
+///
+/// So the length is CLAMPED rather than the partition refused.
+/// Refusing it took away the one thing someone with a truncated image
+/// wants, which is to read what is still there; clamping hands the
+/// driver a slice whose `size_bytes()` is the truth. What must not
+/// happen is the slice reporting more device than exists, because the
+/// driver stacked on it sizes its own structures from that answer.
+///
+/// A partition that begins past the end has nothing on the device at
+/// all, and that is the one case with no slice to make.
+fn slice_on_device(parent_size: u64, start: u64, length: u64) -> Option<u64> {
+    if start >= parent_size {
+        return None;
     }
+    let available = parent_size - start;
+    Some(length.min(available))
 }
 
 /// Free a partition list. Safe to call with NULL.
@@ -452,19 +461,33 @@ fn build_info(p: &Partition, table: TableKindCode) -> PartitionInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::slice_fits;
+    use super::slice_on_device;
 
+    /// A slice must never report more device than exists -- the driver
+    /// stacked on it sizes its own structures from that answer -- but
+    /// refusing an oversized partition outright took away the one thing
+    /// someone with a truncated image wants, which is to read what is
+    /// still there.
     #[test]
-    fn a_partition_must_fit_inside_the_device_it_was_found_on() {
-        assert!(slice_fits(1024, 0, 1024));
-        assert!(slice_fits(1024, 512, 512));
-        // One byte past the end.
-        assert!(!slice_fits(1024, 512, 513));
-        // Starts past the end.
-        assert!(!slice_fits(1024, 4096, 1));
+    fn a_partition_is_clamped_to_the_device_it_was_found_on() {
+        // Wholly inside: untouched.
+        assert_eq!(slice_on_device(1024, 0, 1024), Some(1024));
+        assert_eq!(slice_on_device(1024, 512, 512), Some(512));
+
+        // Running off the end: as much of it as is there. This is a
+        // `dd` of the first part of a disk, or a table left stale after
+        // a shrink.
+        assert_eq!(slice_on_device(1024, 512, 513), Some(512));
+        assert_eq!(slice_on_device(1024, 0, u64::MAX), Some(1024));
+
+        // Beginning past the end: nothing on the device to slice.
+        assert_eq!(slice_on_device(1024, 1024, 1), None);
+        assert_eq!(slice_on_device(1024, 4096, 1), None);
+
         // The pair a GPT entry of starting_lba 2^54 and ending_lba
-        // 2^55 + 99 produces: the sum leaves a u64 entirely.
-        assert!(!slice_fits(64 * 1024, 1 << 63, (1 << 63) + 51200));
+        // 2^55 + 99 produces: the sum leaves a u64 entirely, and the
+        // start alone is already past the device.
+        assert_eq!(slice_on_device(64 * 1024, 1 << 63, (1 << 63) + 51200), None);
     }
 
     use super::*;
