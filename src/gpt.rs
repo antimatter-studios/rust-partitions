@@ -269,8 +269,32 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
 fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partition>, Vec<u8>)> {
     let total_array_bytes =
         (header.num_partition_entries as u64) * (header.partition_entry_size as u64);
+    // Checked, for the same reason `starting_lba` below is: the LBA
+    // comes straight off the disk, and the header CRC is a checksum
+    // rather than a signature, so anyone who can set the field can
+    // restamp the CRC over it. A random header reaches this on the
+    // first try.
+    let array_offset =
+        header
+            .partition_entry_lba
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::GptCorrupt(
+                "partition_entry_lba overflows a byte offset",
+            ))?;
+    // The array cannot be inside a device that does not reach it. This
+    // is also what keeps the allocation above honest: the size fields
+    // are bounded (4096 entries of at most 4096 bytes), but 16 MiB per
+    // probe of a 4 KiB device is still work nobody asked for.
+    let array_end = array_offset
+        .checked_add(total_array_bytes)
+        .ok_or(Error::GptCorrupt("partition entry array overflows"))?;
+    if array_end > dev.size_bytes() {
+        return Err(Error::GptCorrupt(
+            "partition entry array reaches past the end of the device",
+        ));
+    }
     let mut array = vec![0u8; total_array_bytes as usize];
-    dev.read_at(header.partition_entry_lba * SECTOR_SIZE, &mut array)?;
+    dev.read_at(array_offset, &mut array)?;
 
     let computed_entries_crc = crc32fast::hash(&array);
     if computed_entries_crc != header.partition_entry_array_crc32 {

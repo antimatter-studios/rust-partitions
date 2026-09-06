@@ -424,3 +424,65 @@ fn owned_slice_works_through_arc() {
     slice.read_at(8, &mut buf).unwrap();
     assert!(buf.iter().all(|&b| b == 0));
 }
+
+/// Rewrite the GPT header's `partition_entry_lba` and restamp its CRC.
+///
+/// The header CRC is a checksum, not a signature: anyone who can change
+/// a field can recompute it. So a hostile header is a well-formed
+/// header with hostile numbers in it, and the CRC check catches none of
+/// them.
+fn set_partition_entry_lba(dev: &Bytes, lba: u64) {
+    let mut header = [0u8; 512];
+    dev.read_at(512, &mut header).unwrap();
+    header[72..80].copy_from_slice(&lba.to_le_bytes());
+    header[16..20].fill(0);
+    let crc = crc32fast::hash(&header[..92]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write(512, &header);
+}
+
+/// `partition_entry_lba` is multiplied by the sector size to find where
+/// the entry array lives. Fifteen lines below, `starting_lba` is
+/// multiplied by the same constant with `checked_mul`; this one was not.
+#[test]
+fn an_entry_array_lba_that_overflows_a_byte_offset_is_refused() {
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[(type_guids::LINUX_FILESYSTEM, [3u8; 16], 34, 2081, "data")],
+    );
+    set_partition_entry_lba(&dev, u64::MAX);
+
+    match probe(&dev) {
+        Err(_) => {}
+        Ok(what) => panic!("an entry array at LBA 2^64-1 was accepted: {what:?}"),
+    }
+}
+
+/// A partition that does not fit inside the device it was found on.
+///
+/// `probe` still reports it -- what a table says is worth showing even
+/// when it is wrong -- but a slice built on it would report an
+/// impossible size to whatever filesystem driver is stacked on it.
+#[test]
+fn a_partition_reaching_past_the_device_is_still_reported() {
+    let dev = Bytes::new(8 * 1024 * 1024);
+    let past_the_end = (8 * 1024 * 1024 / 512) + 4096;
+    build_gpt_with_entries(
+        &dev,
+        &[(
+            type_guids::LINUX_FILESYSTEM,
+            [4u8; 16],
+            34,
+            past_the_end,
+            "toolong",
+        )],
+    );
+
+    let (_, parts) = probe(&dev).expect("the table itself parses");
+    assert_eq!(parts.len(), 1);
+    assert!(
+        parts[0].start + parts[0].length > dev.size_bytes(),
+        "the fixture does not actually reach past the device"
+    );
+}
