@@ -414,3 +414,58 @@ fn random_uuid_v4_bits_set() {
     assert_eq!(set.disk_guid[7] & 0xF0, 0x40);
     assert_eq!(set.disk_guid[8] & 0xC0, 0x80);
 }
+
+/// The overlap checks and the free-space finder all asked where an
+/// existing partition ends, by adding its start to its length. Both
+/// numbers come from the partition table, which comes off the disk, so
+/// the addition can leave a `u64` -- and in release, where these crates
+/// ship with `overflow-checks` off, it wrapped rather than panicked.
+///
+/// A wrapped end makes an overlap check answer "no overlap" about a
+/// partition that does overlap, which places a new partition on top of
+/// an existing one. A GPT entry of `starting_lba = 2^54` and
+/// `ending_lba = 2^55` produces exactly this pair.
+#[test]
+fn a_partition_whose_start_and_length_overflow_is_refused_not_wrapped() {
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.partitions.push(Partition {
+        start: 1 << 63,
+        length: (1 << 63) + 512,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: Some("overflowing".into()),
+        uuid: Some([7u8; 16]),
+    });
+
+    match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
+        Err(Error::Invalid(_)) => {}
+        other => panic!(
+            "adding beside a partition whose span leaves a u64 gave {other:?}, \
+             which means the wrapped end was used as a real one"
+        ),
+    }
+}
+
+/// The same span, with the length zero rather than overflowing: a
+/// partition with no last sector. `end / SECTOR_SIZE - 1` underflows.
+#[test]
+fn a_zero_length_partition_is_refused_not_underflowed() {
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.partitions.push(Partition {
+        start: 0,
+        length: 0,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: None,
+        uuid: Some([8u8; 16]),
+    });
+
+    match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
+        Err(Error::Invalid(_)) => {}
+        other => panic!("adding beside a zero-length partition gave {other:?}"),
+    }
+}

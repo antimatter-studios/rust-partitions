@@ -367,6 +367,12 @@ pub unsafe extern "C" fn partitions_open_slice(
             return ptr::null_mut();
         }
         let raw = &l.entries[index].raw;
+        if !slice_fits(l.parent.size_bytes(), raw.start, raw.length) {
+            set_last_error(
+                "partitions_open_slice: the partition reaches past the end of the device",
+            );
+            return ptr::null_mut();
+        }
         let slice = OwnedSlice::new(l.parent.clone(), raw.start, raw.length);
         FsCoreDevice::into_handle(Arc::new(slice))
     }));
@@ -374,6 +380,22 @@ pub unsafe extern "C" fn partitions_open_slice(
         set_last_error("panic in partitions_open_slice");
         ptr::null_mut()
     })
+}
+
+/// Whether a partition is somewhere the device actually goes.
+///
+/// A partition table is bytes off the disk, so a partition that claims
+/// to start or end past the device is an ordinary thing to be handed.
+/// `probe` reports it, because what the table says is worth showing
+/// even when it is wrong -- but a slice built on it would tell whatever
+/// filesystem driver is stacked on it that it has more device than
+/// exists, and that driver would size its own structures from the
+/// answer.
+fn slice_fits(parent_size: u64, start: u64, length: u64) -> bool {
+    match start.checked_add(length) {
+        Some(end) => end <= parent_size,
+        None => false,
+    }
 }
 
 /// Free a partition list. Safe to call with NULL.
@@ -430,6 +452,21 @@ fn build_info(p: &Partition, table: TableKindCode) -> PartitionInfo {
 
 #[cfg(test)]
 mod tests {
+    use super::slice_fits;
+
+    #[test]
+    fn a_partition_must_fit_inside_the_device_it_was_found_on() {
+        assert!(slice_fits(1024, 0, 1024));
+        assert!(slice_fits(1024, 512, 512));
+        // One byte past the end.
+        assert!(!slice_fits(1024, 512, 513));
+        // Starts past the end.
+        assert!(!slice_fits(1024, 4096, 1));
+        // The pair a GPT entry of starting_lba 2^54 and ending_lba
+        // 2^55 + 99 produces: the sum leaves a u64 entirely.
+        assert!(!slice_fits(64 * 1024, 1 << 63, (1 << 63) + 51200));
+    }
+
     use super::*;
     use fs_core::ffi::{fs_core_device_close, FsCoreErrorCode};
     use std::sync::Mutex;
