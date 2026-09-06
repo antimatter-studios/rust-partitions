@@ -266,8 +266,11 @@ pub unsafe extern "C" fn partitions_get(
     }));
     match result {
         Ok(rc) => rc,
-        Err(_) => {
-            set_last_error("panic in partitions_get");
+        Err(panic) => {
+            set_last_error(format!(
+                "panic in partitions_get: {}",
+                fs_core::ffi::panic_message(&panic)
+            ));
             FsCoreErrorCode::Panic
         }
     }
@@ -297,8 +300,11 @@ pub unsafe extern "C" fn partitions_sniff(list: *const PartitionList, index: usi
             }
         }
     }));
-    result.unwrap_or_else(|_| {
-        set_last_error("panic in partitions_sniff");
+    result.unwrap_or_else(|panic| {
+        set_last_error(format!(
+            "panic in partitions_sniff: {}",
+            fs_core::ffi::panic_message(&panic)
+        ));
         -1
     })
 }
@@ -338,8 +344,11 @@ pub unsafe extern "C" fn partitions_sniff_device(
             }
         }
     }));
-    result.unwrap_or_else(|_| {
-        set_last_error("panic in partitions_sniff_device");
+    result.unwrap_or_else(|panic| {
+        set_last_error(format!(
+            "panic in partitions_sniff_device: {}",
+            fs_core::ffi::panic_message(&panic)
+        ));
         -1
     })
 }
@@ -376,8 +385,11 @@ pub unsafe extern "C" fn partitions_open_slice(
         let slice = OwnedSlice::new(l.parent.clone(), raw.start, length);
         FsCoreDevice::into_handle(Arc::new(slice))
     }));
-    res.unwrap_or_else(|_| {
-        set_last_error("panic in partitions_open_slice");
+    res.unwrap_or_else(|panic| {
+        set_last_error(format!(
+            "panic in partitions_open_slice: {}",
+            fs_core::ffi::panic_message(&panic)
+        ));
         ptr::null_mut()
     })
 }
