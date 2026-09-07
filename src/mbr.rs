@@ -201,6 +201,7 @@ pub fn parse_all_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Pa
             kind: PartitionKind::Mbr { type_byte, active },
             label: None,
             uuid: None,
+            slot: Some(i as u32),
         });
     }
     Ok(out)
@@ -245,9 +246,10 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
         prev_end_lba = Some(end_lba);
     }
 
+    let slots = crate::gpt_write::assign_slots(partitions, layout::ENTRY_COUNT as u32)?;
     let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
-    for (i, p) in partitions.iter().enumerate() {
-        let off = layout::entry_at(i);
+    for (p, slot) in partitions.iter().zip(&slots) {
+        let off = layout::entry_at(*slot as usize);
         let (type_byte, active) = match p.kind {
             PartitionKind::Mbr { type_byte, active } => (type_byte, active),
             _ => return Err(Error::Invalid("non-MBR partition kind in MBR write")),

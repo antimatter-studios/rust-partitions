@@ -8,6 +8,35 @@ never does.
 
 ### Fixed
 
+- **A commit no longer renumbers the disk.** A partition's slot in the
+  on-disk table is its identity to everything above this crate — the `3`
+  in `/dev/sda3`, the `s3` in `disk4s3` — and it was dropped on the way
+  in and re-derived from vector position on the way out. A GPT with a
+  hole in it is routine, so probe → any edit → commit compacted a sparse
+  table into slots 0..n: nothing about the surviving partitions changed
+  except their numbers, and every fstab entry, boot-loader config and
+  bookmark that named one by number then pointed at a different volume,
+  with the operation reporting success. `PartitionSet::remove` made it
+  worse by shifting every later partition down one.
+
+### Added
+
+- `Partition::slot` — the table slot an entry came from, `None` for a
+  partition not yet placed in one. The writers honour it, give the lowest
+  free slot to a partition that has none, and refuse two partitions
+  claiming the same slot.
+
+### Changed
+
+- **C ABI break.** `PartitionInfo` grows a `slot` field (`-1` when the
+  entry has none) and four bytes of padding, so it is 88 bytes rather
+  than 80. `include/partitions.h` is updated in the same commit and
+  `tests/c_abi.rs` compiles the header against the Rust struct, so the
+  two cannot drift. A C caller that reads `PartitionInfo` needs a
+  recompile.
+
+### Fixed
+
 - **An MBR entry that is not a volume is no longer reported as one.**
   `mbr::parse` emitted every non-empty entry, including the two kinds
   that describe no filesystem: the `0x05` / `0x0F` extended-partition

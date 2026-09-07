@@ -129,6 +129,7 @@ fn mbr_write_round_trip_preserves_active_flag() {
         },
         label: None,
         uuid: None,
+        slot: None,
     };
     mbr::write_mbr(&dev, &[part]).unwrap();
     let (_, parts) = probe::probe(&dev).unwrap();
@@ -147,6 +148,7 @@ fn gpt_efi_system_partition_is_bootable_without_attribute_bit() {
         },
         label: Some("EFI".into()),
         uuid: Some([0u8; 16]),
+        slot: None,
     };
     assert!(p.is_bootable());
 }
@@ -162,6 +164,7 @@ fn gpt_linux_filesystem_with_legacy_bios_bit_is_bootable() {
         },
         label: None,
         uuid: Some([0u8; 16]),
+        slot: None,
     };
     assert!(p.is_bootable());
 }
@@ -177,6 +180,7 @@ fn gpt_linux_filesystem_with_zero_attributes_is_not_bootable() {
         },
         label: None,
         uuid: Some([0u8; 16]),
+        slot: None,
     };
     assert!(!p.is_bootable());
 }
@@ -202,6 +206,7 @@ fn gpt_write_round_trip_preserves_attributes() {
         },
         label: Some("ROOT".into()),
         uuid: Some(part_uuid),
+        slot: None,
     };
     gpt_write::write_gpt(&dev, &[part], disk_guid).unwrap();
     let (kind, parts) = probe::probe(&dev).unwrap();

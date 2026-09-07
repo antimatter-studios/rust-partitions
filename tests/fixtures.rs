@@ -380,6 +380,7 @@ fn sniff_through_partition_offset() {
         },
         label: None,
         uuid: None,
+        slot: None,
     };
     let kind = sniff(&dev, &part).unwrap();
     assert_eq!(kind, FsKind::Ntfs);

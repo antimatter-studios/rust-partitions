@@ -345,6 +345,7 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
             },
             label,
             uuid: Some(unique_guid),
+            slot: Some(i as u32),
         });
     }
     Ok((out, array))

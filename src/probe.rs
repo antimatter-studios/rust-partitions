@@ -22,6 +22,21 @@ pub struct Partition {
     pub kind: PartitionKind,
     pub label: Option<String>,
     pub uuid: Option<[u8; 16]>,
+    /// The slot this entry occupies in the on-disk table, or `None` for
+    /// a partition that has not been placed in one yet.
+    ///
+    /// The slot is the partition's identity to everything above this
+    /// crate: it is the `3` in `/dev/sda3` and the `s3` in `disk4s3`. A
+    /// table with a hole in it is routine — it is what a deletion
+    /// leaves, and it is the normal state of a macOS disk, where slot
+    /// numbering is not compacted — so the position of an entry in the
+    /// returned `Vec` is not its number and never was.
+    ///
+    /// The writers place a partition in its recorded slot and give the
+    /// lowest free one to a partition that has none, which is what stops
+    /// a probe-edit-commit round trip renumbering a disk that nobody
+    /// asked to renumber.
+    pub slot: Option<u32>,
 }
 
 /// The on-disk type-tag for the partition. For GPT this is the type GUID +

@@ -83,6 +83,13 @@ typedef struct {
     uint8_t        _pad2[7];        /* alignment */
     uint64_t       attributes;      /* GPT attributes (entry offset +48);
                                      * 0 for MBR and whole-device entries */
+    int32_t        slot;            /* the entry's slot in the on-disk table —
+                                     * the partition's number to the rest of
+                                     * the system — or -1 when it has none.
+                                     * A table with a hole in it is routine,
+                                     * so the index passed to partitions_get
+                                     * is not the partition's number */
+    uint8_t        _pad3[4];        /* alignment */
 } PartitionInfo;
 
 /* -------------------------------------------------------------------------

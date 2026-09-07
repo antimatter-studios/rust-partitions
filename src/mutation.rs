@@ -238,6 +238,11 @@ impl PartitionSet {
             kind,
             label,
             uuid,
+            // Not in a table yet. `commit` gives it the lowest free
+            // slot, which is not the same as the position it happens to
+            // take in this vector — that would collide with the number
+            // an existing partition already answers to.
+            slot: None,
         };
         let idx = self.partitions.len();
         self.partitions.push(part);
