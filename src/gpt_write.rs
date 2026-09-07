@@ -27,10 +27,142 @@ use crate::probe::{Partition, PartitionKind};
 use fs_core::BlockDevice;
 
 use crate::gpt;
-use crate::gpt_layout::{
-    ENTRY_ARRAY_SECTORS, ENTRY_SIZE, FIRST_USABLE_LBA, HEADER_SIZE, NUM_ENTRIES,
-};
-const ENTRY_ARRAY_BYTES: u64 = (NUM_ENTRIES as u64) * (ENTRY_SIZE as u64);
+use crate::gpt_layout::{ENTRY_SIZE, HEADER_SIZE, NUM_ENTRIES};
+
+/// The shape of a GPT's entry array, and the usable range that follows
+/// from it.
+///
+/// The spec allows any entry count whose array fits, and some firmware
+/// and array controllers write tables that are not the canonical 128.
+/// This crate used to pin the shape in constants and rebuild every
+/// table to it, so a 256-entry disk came back as a 128-entry disk with
+/// no diagnostic — half its partition slots gone, and the old backup
+/// array stranded inside what the new header calls usable space, where
+/// the next partition created can be placed on top of it. A 64-entry
+/// disk went the other way and was refused, with a message blaming a
+/// partition that was perfectly legal.
+///
+/// So the geometry travels with the set: a table that came off a disk
+/// is written back in the shape it was found in, and a table being
+/// created gets the canonical one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GptGeometry {
+    /// Entries the array holds.
+    pub num_entries: u32,
+    /// Bytes per entry.
+    pub entry_size: u32,
+    /// LBA the primary entry array starts at. 2 on every table this
+    /// crate writes, and read from the disk for one it did not.
+    pub entry_lba: u64,
+    /// The usable range the disk declares, for a geometry that came
+    /// off a disk.
+    ///
+    /// `None` for a table being created, where the range follows from
+    /// the device's size. Kept rather than re-derived because a disk
+    /// may reserve more than the minimum — an alignment gap before the
+    /// first partition is ordinary — and re-deriving would hand that
+    /// reserved space out to the next partition added.
+    pub declared_usable: Option<(u64, u64)>,
+}
+
+impl GptGeometry {
+    /// The canonical shape: 128 entries of 128 bytes at LBA 2.
+    pub const fn canonical() -> Self {
+        GptGeometry {
+            num_entries: NUM_ENTRIES,
+            entry_size: ENTRY_SIZE,
+            entry_lba: 2,
+            declared_usable: None,
+        }
+    }
+
+    /// The shape a disk's header describes, including the usable range
+    /// it declares.
+    pub fn from_header(h: &gpt::Header) -> Self {
+        GptGeometry {
+            num_entries: h.num_partition_entries,
+            entry_size: h.partition_entry_size,
+            entry_lba: h.partition_entry_lba,
+            declared_usable: Some((h.first_usable_lba, h.last_usable_lba)),
+        }
+    }
+
+    /// Bytes the entry array occupies.
+    pub fn array_bytes(&self) -> u64 {
+        u64::from(self.num_entries) * u64::from(self.entry_size)
+    }
+
+    /// Sectors the entry array occupies, rounded up: an array that does
+    /// not fill its last sector still owns it.
+    pub fn array_sectors(&self) -> u64 {
+        self.array_bytes().div_ceil(SECTOR_SIZE)
+    }
+
+    /// Sectors reserved at the end of the disk: the backup array and
+    /// the backup header.
+    pub fn backup_reserve_sectors(&self) -> u64 {
+        self.array_sectors() + 1
+    }
+
+    /// The shape itself has to be one a table can have, whatever disk
+    /// it is going on.
+    ///
+    /// Checked before the geometry is used for arithmetic, so a header
+    /// carrying nonsense is refused as a geometry rather than turned
+    /// into an absurd usable range.
+    fn check_shape(&self) -> Result<()> {
+        if self.num_entries == 0 {
+            return Err(Error::Invalid("a GPT with no entry slots"));
+        }
+        if self.entry_size < ENTRY_SIZE || !self.entry_size.is_multiple_of(8) {
+            return Err(Error::Invalid(
+                "a GPT entry size below 128 bytes or not a multiple of 8",
+            ));
+        }
+        if self.entry_lba < 2 {
+            return Err(Error::Invalid(
+                "a GPT entry array starting at or before the header",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The usable range on a device of `total_sectors`, or why this
+    /// geometry does not fit it.
+    ///
+    /// A declared range is checked rather than trusted: it must start
+    /// no earlier than the entry array ends and finish no later than
+    /// the backup reserve begins, or the table would describe usable
+    /// space on top of its own metadata.
+    pub fn usable_range(&self, total_sectors: u64) -> Result<(u64, u64)> {
+        self.check_shape()?;
+        let first_possible = self.entry_lba + self.array_sectors();
+        let reserve = self.backup_reserve_sectors();
+        if total_sectors <= first_possible + reserve {
+            return Err(Error::DeviceTooSmall);
+        }
+        let last_possible = total_sectors - 1 - reserve;
+        match self.declared_usable {
+            None => Ok((first_possible, last_possible)),
+            Some((first, last)) => {
+                if first < first_possible {
+                    return Err(Error::Invalid(
+                        "the table's first usable LBA is inside its own entry array",
+                    ));
+                }
+                if last > last_possible {
+                    return Err(Error::Invalid(
+                        "the table's last usable LBA is inside the space the backup copy needs",
+                    ));
+                }
+                if first > last {
+                    return Err(Error::Invalid("the table's usable range runs backwards"));
+                }
+                Ok((first, last))
+            }
+        }
+    }
+}
 
 /// Write a complete GPT to `dev`. The caller owns the partition list and the
 /// disk GUID; this function does not mutate either.
@@ -40,29 +172,44 @@ const ENTRY_ARRAY_BYTES: u64 = (NUM_ENTRIES as u64) * (ENTRY_SIZE as u64);
 ///   non-GPT entry is rejected with [`Error::Invalid`].
 /// - Each partition must have a UUID. Callers building a fresh table can
 ///   mint one through the public helpers in [`crate::mutation`].
-/// - All start/length pairs must lie within the usable range (LBA 34 ..=
-///   last_lba - 33), be sector-aligned, and not overlap each other.
-/// - At most [`NUM_ENTRIES`] partitions are accepted.
+/// - All start/length pairs must lie within the table's usable range, be
+///   sector-aligned, and not overlap each other.
+/// - At most as many partitions as the table has entry slots.
 pub fn write_gpt(
     dev: &dyn BlockDevice,
     partitions: &[Partition],
     disk_guid: [u8; 16],
+) -> Result<()> {
+    write_gpt_with_geometry(dev, partitions, disk_guid, GptGeometry::canonical())
+}
+
+/// As [`write_gpt`], in the entry-array shape `geometry` describes.
+///
+/// A table read off a disk is written back the shape it was found in.
+/// Rebuilding every table to the canonical 128 entries silently halved
+/// a 256-entry disk's partition capacity and left its old backup array
+/// stranded inside the new usable range; it also refused a legal
+/// 64-entry disk, blaming a partition rather than the geometry the
+/// crate had discarded.
+pub fn write_gpt_with_geometry(
+    dev: &dyn BlockDevice,
+    partitions: &[Partition],
+    disk_guid: [u8; 16],
+    geometry: GptGeometry,
 ) -> Result<()> {
     if !dev.is_writable() {
         return Err(Error::Block(fs_core::Error::ReadOnly));
     }
 
     let total_bytes = dev.size_bytes();
-    if total_bytes < (FIRST_USABLE_LBA + ENTRY_ARRAY_SECTORS + 1) * SECTOR_SIZE {
-        return Err(Error::DeviceTooSmall);
-    }
     let total_sectors = total_bytes / SECTOR_SIZE;
+    let (first_usable_lba, last_usable_lba) = geometry.usable_range(total_sectors)?;
     let last_lba = total_sectors - 1;
-    let last_usable_lba = last_lba - ENTRY_ARRAY_SECTORS - 1; // = last_lba - 33
+    let array_sectors = geometry.array_sectors();
 
-    if partitions.len() > NUM_ENTRIES as usize {
+    if partitions.len() > geometry.num_entries as usize {
         return Err(Error::Invalid(
-            "too many partitions for canonical 128-slot table",
+            "more partitions than the table has entry slots",
         ));
     }
 
@@ -72,7 +219,7 @@ pub fn write_gpt(
     // writer refused what the reader had just handed the caller.
     let mut spans: Vec<(u64, u64)> = Vec::with_capacity(partitions.len());
     for p in partitions {
-        validate_partition(p, FIRST_USABLE_LBA, last_usable_lba)?;
+        validate_partition(p, first_usable_lba, last_usable_lba)?;
         spans.push(p.sector_span()?);
     }
     if gpt::mark_overlaps(&spans).iter().any(|&o| o) {
@@ -80,10 +227,10 @@ pub fn write_gpt(
     }
 
     // --- Build the entry array (16 KiB, all zeros + populated slots). ---
-    let slots = assign_slots(partitions, NUM_ENTRIES)?;
-    let mut array = vec![0u8; ENTRY_ARRAY_BYTES as usize];
+    let slots = assign_slots(partitions, geometry.num_entries)?;
+    let mut array = vec![0u8; geometry.array_bytes() as usize];
     for (p, slot) in partitions.iter().zip(&slots) {
-        let off = (*slot as usize) * ENTRY_SIZE as usize;
+        let off = (*slot as usize) * geometry.entry_size as usize;
         let (type_guid, attributes) = match p.kind {
             PartitionKind::Gpt {
                 type_guid,
@@ -157,19 +304,19 @@ pub fn write_gpt(
     let primary = build_header(
         /* my_lba */ 1,
         /* alternate_lba */ last_lba,
-        /* entry_lba */ 2,
-        /* first_usable */ FIRST_USABLE_LBA,
-        /* last_usable */ last_usable_lba,
+        /* entry_lba */ geometry.entry_lba,
+        /* usable */ (first_usable_lba, last_usable_lba),
         disk_guid,
         entry_array_crc,
+        geometry,
     );
     dev.write_at(SECTOR_SIZE, &primary)?;
 
-    // --- Primary entry array at LBA 2 ---
-    dev.write_at(2 * SECTOR_SIZE, &array)?;
+    // --- Primary entry array where the header says it is ---
+    dev.write_at(geometry.entry_lba * SECTOR_SIZE, &array)?;
 
-    // --- Backup entry array at LBA (last_lba - 32) ---
-    let backup_entries_lba = last_lba - ENTRY_ARRAY_SECTORS;
+    // --- Backup entry array, immediately before the backup header ---
+    let backup_entries_lba = last_lba - array_sectors;
     dev.write_at(backup_entries_lba * SECTOR_SIZE, &array)?;
 
     // --- Backup header at last LBA. ---
@@ -177,10 +324,10 @@ pub fn write_gpt(
         /* my_lba */ last_lba,
         /* alternate_lba */ 1,
         /* entry_lba */ backup_entries_lba,
-        /* first_usable */ FIRST_USABLE_LBA,
-        /* last_usable */ last_usable_lba,
+        /* usable */ (first_usable_lba, last_usable_lba),
         disk_guid,
         entry_array_crc,
+        geometry,
     );
     dev.write_at(last_lba * SECTOR_SIZE, &backup)?;
 
@@ -292,11 +439,14 @@ fn build_header(
     my_lba: u64,
     alternate_lba: u64,
     entry_lba: u64,
-    first_usable: u64,
-    last_usable: u64,
+    // The two ends travel together: they are one range, and splitting
+    // them into two parameters was the eighth argument.
+    usable: (u64, u64),
     disk_guid: [u8; 16],
     entry_array_crc: u32,
+    geometry: GptGeometry,
 ) -> [u8; crate::SECTOR_SIZE_USIZE] {
+    let (first_usable, last_usable) = usable;
     let mut h = [0u8; crate::SECTOR_SIZE_USIZE];
     h[0..8].copy_from_slice(SIGNATURE);
     h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // revision 1.0
@@ -312,12 +462,153 @@ fn build_header(
     h[gpt::header_offsets::PARTITION_ENTRY_LBA..gpt::header_offsets::PARTITION_ENTRY_LBA + 8]
         .copy_from_slice(&entry_lba.to_le_bytes());
     h[gpt::header_offsets::NUM_PARTITION_ENTRIES..gpt::header_offsets::NUM_PARTITION_ENTRIES + 4]
-        .copy_from_slice(&NUM_ENTRIES.to_le_bytes());
+        .copy_from_slice(&geometry.num_entries.to_le_bytes());
     h[gpt::header_offsets::PARTITION_ENTRY_SIZE..gpt::header_offsets::PARTITION_ENTRY_SIZE + 4]
-        .copy_from_slice(&ENTRY_SIZE.to_le_bytes());
+        .copy_from_slice(&geometry.entry_size.to_le_bytes());
     h[88..92].copy_from_slice(&entry_array_crc.to_le_bytes());
 
     let header_crc = crc32fast::hash(&h[..HEADER_SIZE as usize]);
     h[16..20].copy_from_slice(&header_crc.to_le_bytes());
     h
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    /// A 64 MiB disk, in sectors.
+    const SECTORS: u64 = 64 * 1024 * 1024 / 512;
+
+    fn canonical() -> GptGeometry {
+        GptGeometry::canonical()
+    }
+
+    /// The canonical shape gives the numbers this crate has always
+    /// used, which is what says the general form did not move them.
+    #[test]
+    fn the_canonical_geometry_is_the_34_and_33_this_crate_had_pinned() {
+        let g = canonical();
+        assert_eq!(g.array_sectors(), 32);
+        assert_eq!(g.backup_reserve_sectors(), 33);
+        assert_eq!(g.usable_range(SECTORS).unwrap(), (34, SECTORS - 34));
+    }
+
+    /// A bigger array pushes the first usable LBA out and pulls the
+    /// last one in, by the same amount at each end.
+    #[test]
+    fn a_256_entry_array_moves_both_ends_of_the_usable_range() {
+        let g = GptGeometry {
+            num_entries: 256,
+            ..canonical()
+        };
+        assert_eq!(g.array_sectors(), 64);
+        assert_eq!(g.usable_range(SECTORS).unwrap(), (66, SECTORS - 66));
+    }
+
+    /// An array that does not fill its last sector still owns it.
+    ///
+    /// 3 entries of 128 bytes is 384 bytes — most of a sector, and no
+    /// partition may start in the rest of it.
+    #[test]
+    fn an_array_shorter_than_a_sector_still_occupies_one() {
+        let g = GptGeometry {
+            num_entries: 3,
+            ..canonical()
+        };
+        assert_eq!(g.array_sectors(), 1);
+        assert_eq!(g.usable_range(SECTORS).unwrap(), (3, SECTORS - 3));
+    }
+
+    /// A declared range narrower than the minimum is kept, because a
+    /// disk may reserve more than the metadata needs.
+    #[test]
+    fn a_declared_range_narrower_than_the_minimum_is_kept() {
+        let g = GptGeometry {
+            declared_usable: Some((2048, SECTORS - 2048)),
+            ..canonical()
+        };
+        assert_eq!(g.usable_range(SECTORS).unwrap(), (2048, SECTORS - 2048));
+    }
+
+    /// Each way a geometry can fail to describe a table, refused with
+    /// the reason that names it.
+    ///
+    /// One case per clause: a check that is never the only reason a
+    /// geometry is refused is a check nothing would notice losing.
+    #[test]
+    fn a_geometry_that_cannot_describe_a_table_is_refused() {
+        let cases: &[(GptGeometry, &str)] = &[
+            (
+                GptGeometry {
+                    num_entries: 0,
+                    ..canonical()
+                },
+                "no entry slots",
+            ),
+            (
+                GptGeometry {
+                    entry_size: 64,
+                    ..canonical()
+                },
+                "below 128 bytes",
+            ),
+            (
+                GptGeometry {
+                    entry_size: 132,
+                    ..canonical()
+                },
+                "multiple of 8",
+            ),
+            (
+                GptGeometry {
+                    entry_lba: 1,
+                    ..canonical()
+                },
+                "before the header",
+            ),
+            (
+                GptGeometry {
+                    declared_usable: Some((33, SECTORS - 34)),
+                    ..canonical()
+                },
+                "inside its own entry array",
+            ),
+            (
+                GptGeometry {
+                    declared_usable: Some((34, SECTORS - 33)),
+                    ..canonical()
+                },
+                "the backup copy needs",
+            ),
+            (
+                GptGeometry {
+                    declared_usable: Some((100, 99)),
+                    ..canonical()
+                },
+                "runs backwards",
+            ),
+        ];
+        for (geometry, expected) in cases {
+            match geometry.usable_range(SECTORS) {
+                Err(Error::Invalid(m)) => assert!(
+                    m.contains(expected),
+                    "refused for the wrong reason: wanted {expected:?}, got {m:?}"
+                ),
+                other => panic!("{geometry:?} gave {other:?}, wanted {expected:?}"),
+            }
+        }
+    }
+
+    /// A disk with no room for the table's own metadata is too small,
+    /// and says so rather than producing a backwards range.
+    #[test]
+    fn a_disk_too_small_for_the_geometry_is_refused_as_too_small() {
+        let g = canonical();
+        // 34 for the front, 33 for the back, and at least one usable.
+        assert!(g.usable_range(68).is_ok());
+        match g.usable_range(67) {
+            Err(Error::DeviceTooSmall) => {}
+            other => panic!("a disk one sector too small gave {other:?}"),
+        }
+    }
 }

@@ -20,9 +20,7 @@ use fs_core::{BlockDevice, BlockRead};
 ///
 /// The doc that used to sit here said "spec-mandated GPT slot count",
 /// which describes the 128 that is one term of this sum, not the sum.
-use crate::gpt_layout::{
-    BACKUP_RESERVE_SECTORS as GPT_BACKUP_RESERVE_SECTORS, FIRST_USABLE_LBA as GPT_FIRST_USABLE_LBA,
-};
+use crate::gpt_layout::FIRST_USABLE_LBA as GPT_FIRST_USABLE_LBA;
 use crate::SECTOR_SIZE;
 /// 1 MiB alignment in 512-byte sectors. Most partition-table editors use
 /// this as the default and Windows / macOS treat it as a soft requirement.
@@ -100,6 +98,14 @@ pub struct PartitionSet {
     pub disk_size: u64,
     /// Disk GUID for the GPT header. Ignored when `table_kind == Mbr`.
     pub disk_guid: [u8; 16],
+    /// The shape of the GPT this set came off, or the canonical shape
+    /// for one being created. Ignored when `table_kind == Mbr`.
+    ///
+    /// Carried because a table that came off a disk has to go back in
+    /// the shape it was found in: rebuilding every table to 128 entries
+    /// silently halved a 256-entry disk's partition capacity, and
+    /// refused a legal 64-entry one while blaming a partition.
+    pub gpt_geometry: crate::gpt_write::GptGeometry,
     /// The MBR entries `probe` did not report — an extended container,
     /// a hybrid `0xEE` marker — each with the slot it occupies.
     ///
@@ -126,19 +132,26 @@ impl PartitionSet {
         } else {
             Vec::new()
         };
-        let disk_guid = if table_kind == TableKind::Gpt {
-            // Re-read LBA 1 to pull the disk GUID out.
+        let (disk_guid, gpt_geometry) = if table_kind == TableKind::Gpt {
+            // Re-read LBA 1 for the disk GUID and the table's shape.
+            // The header states both, and taking only the GUID was what
+            // let a commit reshape the table.
             let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
             dev.read_at(SECTOR_SIZE, &mut sector)?;
-            gpt::parse_header(&sector)?.disk_guid
+            let header = gpt::parse_header(&sector)?;
+            (
+                header.disk_guid,
+                crate::gpt_write::GptGeometry::from_header(&header),
+            )
         } else {
-            [0u8; 16]
+            ([0u8; 16], crate::gpt_write::GptGeometry::canonical())
         };
         Ok(PartitionSet {
             table_kind,
             partitions,
             disk_size,
             disk_guid,
+            gpt_geometry,
             reserved,
         })
     }
@@ -150,6 +163,7 @@ impl PartitionSet {
             partitions: Vec::new(),
             disk_size,
             disk_guid: random_uuid(),
+            gpt_geometry: crate::gpt_write::GptGeometry::canonical(),
             reserved: Vec::new(),
         }
     }
@@ -161,6 +175,7 @@ impl PartitionSet {
             partitions: Vec::new(),
             disk_size,
             disk_guid: [0u8; 16],
+            gpt_geometry: crate::gpt_write::GptGeometry::canonical(),
             reserved: Vec::new(),
         }
     }
@@ -190,8 +205,10 @@ impl PartitionSet {
         {
             return Err(Error::Invalid("MBR primary table is full (4 entries)"));
         }
-        if self.table_kind == TableKind::Gpt && self.partitions.len() >= 128 {
-            return Err(Error::Invalid("GPT canonical table is full (128 entries)"));
+        if self.table_kind == TableKind::Gpt
+            && self.partitions.len() >= self.gpt_geometry.num_entries as usize
+        {
+            return Err(Error::Invalid("the GPT's entry array is full"));
         }
 
         // Round length up to a sector multiple.
@@ -324,7 +341,12 @@ impl PartitionSet {
     pub fn commit(&self, dev: &dyn BlockDevice) -> Result<()> {
         match self.table_kind {
             TableKind::Gpt => {
-                crate::gpt_write::write_gpt(dev, &self.partitions, self.disk_guid)?;
+                crate::gpt_write::write_gpt_with_geometry(
+                    dev,
+                    &self.partitions,
+                    self.disk_guid,
+                    self.gpt_geometry,
+                )?;
             }
             TableKind::Mbr => {
                 mbr::write_mbr_preserving(dev, &self.partitions, &self.reserved)?;
@@ -340,11 +362,17 @@ impl PartitionSet {
         let total_sectors = self.disk_size / SECTOR_SIZE;
         match self.table_kind {
             TableKind::Gpt => {
-                if total_sectors < GPT_FIRST_USABLE_LBA + GPT_BACKUP_RESERVE_SECTORS + 1 {
-                    return (GPT_FIRST_USABLE_LBA, GPT_FIRST_USABLE_LBA - 1);
+                // One statement of the rules, on the geometry, so the
+                // planner and the writer cannot disagree about where a
+                // partition may go on this particular disk.
+                //
+                // An inverted range is this function's way of saying
+                // "nowhere", which every caller already treats as the
+                // device being too small.
+                match self.gpt_geometry.usable_range(total_sectors) {
+                    Ok(range) => range,
+                    Err(_) => (GPT_FIRST_USABLE_LBA, GPT_FIRST_USABLE_LBA - 1),
                 }
-                let last = total_sectors - 1 - GPT_BACKUP_RESERVE_SECTORS;
-                (GPT_FIRST_USABLE_LBA, last)
             }
             TableKind::Mbr => {
                 if total_sectors < 2 {

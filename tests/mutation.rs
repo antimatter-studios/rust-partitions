@@ -1079,3 +1079,200 @@ fn the_mbr_writer_counts_preserved_entries_against_the_four_slots() {
         other => panic!("four volumes beside a preserved entry gave {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The table's shape survives a round trip
+// ---------------------------------------------------------------------------
+
+use partitions::gpt_write::{write_gpt_with_geometry, GptGeometry};
+
+/// The header fields that describe the table's shape.
+fn gpt_shape(dev: &MemDev) -> (u32, u32, u64, u64, u64) {
+    let mut sector = [0u8; 512];
+    dev.read_at(512, &mut sector).unwrap();
+    let h = gpt::parse_header(&sector).unwrap();
+    (
+        h.num_partition_entries,
+        h.partition_entry_size,
+        h.partition_entry_lba,
+        h.first_usable_lba,
+        h.last_usable_lba,
+    )
+}
+
+/// Lay down a GPT in `geometry`'s shape with one partition in it, and
+/// assert the header really says so before any test depends on it.
+///
+/// The fixture is written through the writer's own geometry path rather
+/// than by hand. That is worth stating plainly: it means a change that
+/// stopped the writer honouring a geometry would show up here as a
+/// fixture that is not the shape it asked for, which the assertion
+/// below catches — not as a test that quietly checks 128 against 128.
+fn build_gpt_shaped(dev: &MemDev, geometry: GptGeometry, start_lba: u64) {
+    let p = Partition {
+        start: start_lba * 512,
+        length: 4 * ONE_MIB,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: Some("data".into()),
+        uuid: Some([0x5Au8; 16]),
+        slot: Some(0),
+        issues: 0,
+    };
+    write_gpt_with_geometry(dev, &[p], [0x11u8; 16], geometry).unwrap();
+
+    let (entries, size, entry_lba, first, _last) = gpt_shape(dev);
+    assert_eq!(entries, geometry.num_entries, "fixture entry count");
+    assert_eq!(size, geometry.entry_size, "fixture entry size");
+    assert_eq!(entry_lba, geometry.entry_lba, "fixture entry array LBA");
+    assert_eq!(
+        first,
+        geometry.entry_lba + geometry.array_sectors(),
+        "fixture first usable LBA"
+    );
+}
+
+/// A round trip that changes nothing leaves a 256-entry table with 256
+/// entries.
+///
+/// `from_probe` took the disk GUID out of the header and dropped the
+/// rest, and `commit` rebuilt the table from pinned constants. A
+/// 256-entry disk came back as a 128-entry disk, `Ok(())`, with no
+/// diagnostic: half its partition slots gone, and its old backup array
+/// stranded inside what the new header calls usable space, where the
+/// next partition created can be placed on top of it.
+#[test]
+fn a_commit_that_changed_nothing_keeps_a_256_entry_table() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let geometry = GptGeometry {
+        num_entries: 256,
+        ..GptGeometry::canonical()
+    };
+    build_gpt_shaped(&dev, geometry, 2048);
+
+    let before = gpt_shape(&dev);
+    assert_eq!(before.0, 256);
+    assert_eq!(before.3, 66, "a 256-entry array ends at LBA 65");
+
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+
+    assert_eq!(
+        gpt_shape(&dev),
+        before,
+        "a commit that changed nothing reshaped the table"
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(
+        parts.len(),
+        1,
+        "the partition did not survive the round trip"
+    );
+}
+
+/// The same round trip on a table smaller than the canonical one, which
+/// failed loudly rather than quietly.
+///
+/// A 64-entry array is 16 sectors, so the first usable LBA is 18 and a
+/// partition may legally start at 20. Measured against the pinned 34,
+/// `commit` refused it — and blamed the partition, which was fine.
+#[test]
+fn a_64_entry_table_round_trips_with_a_partition_the_canonical_shape_would_refuse() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let geometry = GptGeometry {
+        num_entries: 64,
+        ..GptGeometry::canonical()
+    };
+    build_gpt_shaped(&dev, geometry, 20);
+
+    let before = gpt_shape(&dev);
+    assert_eq!(before.0, 64);
+    assert_eq!(before.3, 18, "a 64-entry array ends at LBA 17");
+
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.partitions.len(), 1);
+    assert_eq!(set.partitions[0].start, 20 * 512);
+    set.commit(&dev).unwrap();
+
+    assert_eq!(
+        gpt_shape(&dev),
+        before,
+        "a commit that changed nothing reshaped the table"
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts[0].start, 20 * 512, "the partition moved or vanished");
+}
+
+/// A disk that reserves more space than the metadata needs keeps its
+/// reservation.
+///
+/// An alignment gap before the first partition is ordinary — plenty of
+/// disks declare a first usable LBA of 2048 — and re-deriving the range
+/// from the entry count would hand that reserved space to the next
+/// partition added. This is the case that distinguishes "carry the
+/// declared range" from "recompute it and hope they match".
+#[test]
+fn a_declared_usable_range_wider_than_the_metadata_needs_survives() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let total_sectors = DISK_64M / 512;
+    // 8192 rather than 2048: the planner aligns to 1 MiB, which is
+    // 2048 sectors, so a reservation of exactly 2048 is one a planner
+    // ignoring the declared range would land on anyway. A test whose
+    // expected answer is also the wrong code's answer measures nothing.
+    let geometry = GptGeometry {
+        declared_usable: Some((8192, total_sectors - 8192)),
+        ..GptGeometry::canonical()
+    };
+    build_gpt_shaped_declared(&dev, geometry, 40960);
+
+    let before = gpt_shape(&dev);
+    assert_eq!(before.3, 8192, "fixture first usable LBA");
+    assert_eq!(before.4, total_sectors - 8192, "fixture last usable LBA");
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    // And the reservation is respected by the planner, not merely
+    // copied into the header: a partition added with no hint lands
+    // inside the declared range.
+    set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    set.commit(&dev).unwrap();
+
+    assert_eq!(
+        gpt_shape(&dev),
+        before,
+        "a commit narrowed the disk's declared usable range"
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    for p in &parts {
+        assert!(
+            p.start / 512 >= 8192,
+            "a partition was placed inside the reserved gap at LBA {}",
+            p.start / 512
+        );
+    }
+}
+
+/// As `build_gpt_shaped`, for a geometry whose usable range is declared
+/// rather than derived: the first usable LBA is then the declared one.
+fn build_gpt_shaped_declared(dev: &MemDev, geometry: GptGeometry, start_lba: u64) {
+    let p = Partition {
+        start: start_lba * 512,
+        length: 4 * ONE_MIB,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: Some("data".into()),
+        uuid: Some([0x5Au8; 16]),
+        slot: Some(0),
+        issues: 0,
+    };
+    write_gpt_with_geometry(dev, &[p], [0x11u8; 16], geometry).unwrap();
+    let (entries, _, _, first, last) = gpt_shape(dev);
+    assert_eq!(entries, geometry.num_entries, "fixture entry count");
+    let (want_first, want_last) = geometry.declared_usable.expect("a declared range");
+    assert_eq!(first, want_first, "fixture first usable LBA");
+    assert_eq!(last, want_last, "fixture last usable LBA");
+}
