@@ -721,3 +721,125 @@ fn gpt_partition(start: u64, length: u64, label: &str, uuid: u8, slot: Option<u3
         slot,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Labels made of more than the basic multilingual plane
+// ---------------------------------------------------------------------------
+
+/// A GPT label is 72 bytes of UTF-16, so 36 code units, and a character
+/// outside the basic multilingual plane takes two of them. Truncating at
+/// 36 units without regard for that leaves a lone high surrogate on
+/// disk, and the reader answers `String::from_utf16(..).ok()` — which is
+/// `None` for an unpaired surrogate.
+///
+/// So the label does not come back shortened. It comes back **absent**:
+/// a caller that wrote a 35-character name ending in an emoji reads a
+/// partition with no name at all, and nothing says why.
+#[test]
+fn a_label_that_would_split_a_surrogate_pair_is_not_lost() {
+    let dev = MemDev::new(DISK_64M as usize);
+    // 35 BMP characters, then one that needs a surrogate pair: the pair
+    // straddles the 36-unit boundary.
+    let label: String = "a".repeat(35) + "\u{1F600}";
+    assert_eq!(label.encode_utf16().count(), 37);
+
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some(label.clone()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, parts) = probe(&dev).unwrap();
+    let got = parts[0]
+        .label
+        .clone()
+        .expect("the label was dropped entirely, not shortened");
+    assert_eq!(
+        got,
+        "a".repeat(35),
+        "a label must be cut at a character boundary, not inside one"
+    );
+}
+
+/// A whole astral character fits when there is room for both of its
+/// units, and must survive.
+#[test]
+fn a_label_whose_surrogate_pair_fits_survives_whole() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let label: String = "a".repeat(34) + "\u{1F600}";
+    assert_eq!(label.encode_utf16().count(), 36);
+
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some(label.clone()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts[0].label.as_deref(), Some(label.as_str()));
+}
+
+/// A table another tool wrote can still carry an unpaired surrogate.
+/// Showing the rest of the name with one replacement character tells a
+/// user more than showing no name at all, so the reader stops throwing
+/// the whole label away.
+#[test]
+fn a_label_another_writer_truncated_mid_pair_is_still_shown() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("data".into()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    // Overwrite the entry's name with "da" + a lone high surrogate, and
+    // repair the CRCs so the table is otherwise valid.
+    let entry_array_lba = 2u64;
+    let name_off = (entry_array_lba * 512) as usize + 56;
+    let mut units: Vec<u16> = "da".encode_utf16().collect();
+    units.push(0xD83D); // high surrogate with no low half
+    let mut name = vec![0u8; 72];
+    for (i, u) in units.iter().enumerate() {
+        name[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    patch_entry_name_and_repair_crcs(&dev, name_off, &name);
+
+    let (_, parts) = probe(&dev).unwrap();
+    let got = parts[0].label.clone().expect("the label was dropped");
+    assert!(
+        got.starts_with("da"),
+        "the readable part of the name must survive, got {got:?}"
+    );
+}
+
+/// Write `name` at `name_off` and recompute the entry-array CRC and the
+/// primary header CRC so the table stays valid.
+fn patch_entry_name_and_repair_crcs(dev: &MemDev, name_off: usize, name: &[u8]) {
+    let mut b = dev.0.lock().unwrap();
+    b[name_off..name_off + name.len()].copy_from_slice(name);
+
+    // Header at LBA 1; entry array at the LBA it names.
+    let array_lba = u64::from_le_bytes(b[512 + 72..512 + 80].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(b[512 + 80..512 + 84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(b[512 + 84..512 + 88].try_into().unwrap()) as usize;
+    let array = &b[array_lba * 512..array_lba * 512 + count * size];
+    let array_crc = crc32fast::hash(array);
+    b[512 + 88..512 + 92].copy_from_slice(&array_crc.to_le_bytes());
+
+    let header_size = u32::from_le_bytes(b[512 + 12..512 + 16].try_into().unwrap()) as usize;
+    b[512 + 16..512 + 20].fill(0);
+    let header_crc = crc32fast::hash(&b[512..512 + header_size]);
+    b[512 + 16..512 + 20].copy_from_slice(&header_crc.to_le_bytes());
+}
