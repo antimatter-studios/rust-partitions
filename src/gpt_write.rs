@@ -66,19 +66,17 @@ pub fn write_gpt(
         ));
     }
 
-    // Sort copy by start LBA so overlap detection is one linear pass.
-    let mut sorted: Vec<(usize, &Partition)> = partitions.iter().enumerate().collect();
-    sorted.sort_by_key(|(_, p)| p.start);
-    let mut prev_end_lba: Option<u64> = None;
-    for (_, p) in &sorted {
+    // The usable-range and overlap rules are the reader's too, so both
+    // sides call `gpt::range_issues` and `gpt::mark_overlaps` rather
+    // than each carrying its own copy. They disagreed before: the
+    // writer refused what the reader had just handed the caller.
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(partitions.len());
+    for p in partitions {
         validate_partition(p, FIRST_USABLE_LBA, last_usable_lba)?;
-        let (start_lba, end_lba) = p.sector_span()?;
-        if let Some(prev) = prev_end_lba {
-            if start_lba <= prev {
-                return Err(Error::Invalid("partitions overlap"));
-            }
-        }
-        prev_end_lba = Some(end_lba);
+        spans.push(p.sector_span()?);
+    }
+    if gpt::mark_overlaps(&spans).iter().any(|&o| o) {
+        return Err(Error::Invalid("partitions overlap"));
     }
 
     // --- Build the entry array (16 KiB, all zeros + populated slots). ---
@@ -248,19 +246,15 @@ fn validate_partition(p: &Partition, first_usable: u64, last_usable: u64) -> Res
         return Err(Error::Invalid("partition not sector-aligned"));
     }
     let (start_lba, end_lba) = p.sector_span()?;
-    if start_lba < first_usable {
+    // The same statement of the usable-range rules the reader applies.
+    // The start needs its own upper bound, not just the end's, and
+    // `range_issues` carries that reasoning.
+    let issues = gpt::range_issues(start_lba, end_lba, first_usable, last_usable);
+    if issues & gpt::entry_issue::BEFORE_FIRST_USABLE != 0 {
         return Err(Error::Invalid("partition starts before first usable LBA"));
     }
-    // The start needs its own upper bound, not just the end's. Without
-    // it the only thing keeping an absurd `start` out of the table is
-    // the end check, and a `start` far enough out makes the end wrap to
-    // something small -- which that check then waves through. A refusal
-    // by name beats one that depends on the arithmetic not wrapping.
-    if start_lba > last_usable {
-        return Err(Error::Invalid("partition starts past last usable LBA"));
-    }
-    if end_lba > last_usable {
-        return Err(Error::Invalid("partition ends past last usable LBA"));
+    if issues & gpt::entry_issue::PAST_LAST_USABLE != 0 {
+        return Err(Error::Invalid("partition runs past last usable LBA"));
     }
     if let PartitionKind::Gpt { type_guid, .. } = p.kind {
         if type_guid == type_guids::UNUSED {

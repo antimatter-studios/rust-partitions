@@ -438,6 +438,7 @@ fn a_partition_whose_start_and_length_overflow_is_refused_not_wrapped() {
         label: Some("overflowing".into()),
         uuid: Some([7u8; 16]),
         slot: None,
+        issues: 0,
     });
 
     match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
@@ -464,6 +465,7 @@ fn a_zero_length_partition_is_refused_not_underflowed() {
         label: None,
         uuid: Some([8u8; 16]),
         slot: None,
+        issues: 0,
     });
 
     match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
@@ -501,6 +503,7 @@ fn overflowing_gpt_partition() -> Partition {
         label: Some("overflowing".into()),
         uuid: Some([9u8; 16]),
         slot: None,
+        issues: 0,
     }
 }
 
@@ -556,6 +559,7 @@ fn write_gpt_refuses_an_overflowing_span_beside_a_real_partition() {
         label: None,
         uuid: Some([3u8; 16]),
         slot: None,
+        issues: 0,
     };
     match partitions::gpt_write::write_gpt(&dev, &[sound, overflowing_gpt_partition()], [1u8; 16]) {
         Err(Error::Invalid(_)) => {}
@@ -582,6 +586,7 @@ fn write_mbr_refuses_a_span_that_leaves_a_u64() {
         label: None,
         uuid: None,
         slot: None,
+        issues: 0,
     };
     match partitions::mbr::write_mbr(&dev, &[p]) {
         Err(Error::Invalid(_)) => {}
@@ -719,6 +724,7 @@ fn gpt_partition(start: u64, length: u64, label: &str, uuid: u8, slot: Option<u3
         label: Some(label.into()),
         uuid: Some([uuid; 16]),
         slot,
+        issues: 0,
     }
 }
 

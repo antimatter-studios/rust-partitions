@@ -55,7 +55,7 @@ fn partition_info_layout() -> Vec<(&'static str, usize)> {
         ("_pad2", offset_of!(PartitionInfo, _pad2)),
         ("attributes", offset_of!(PartitionInfo, attributes)),
         ("slot", offset_of!(PartitionInfo, slot)),
-        ("_pad3", offset_of!(PartitionInfo, _pad3)),
+        ("issues", offset_of!(PartitionInfo, issues)),
     ]
 }
 

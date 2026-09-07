@@ -37,6 +37,27 @@ pub struct Partition {
     /// a probe-edit-commit round trip renumbering a disk that nobody
     /// asked to renumber.
     pub slot: Option<u32>,
+    /// Which of the table's own rules this entry breaks, as a set of
+    /// [`crate::gpt::entry_issue`] bits — zero when it breaks none.
+    ///
+    /// A partition table is bytes off a disk, so an entry that breaks a
+    /// rule is an ordinary thing to be handed. Refusing the whole table
+    /// would make a damaged disk unreadable *and* uneditable, which is
+    /// the opposite of what somebody looking at one needs. Reporting
+    /// per entry keeps [`crate::probe`] total and puts the policy where
+    /// it belongs — with the caller, who can show the user which entry
+    /// is wrong and about what.
+    ///
+    /// What must not happen is a caller acting on a bad entry without
+    /// being told, which is why
+    /// [`partitions_open_slice`](crate::capi::partitions_open_slice)
+    /// refuses one: the slice for an entry sitting on LBA 1..33 covers
+    /// the GPT header and the entry array, and a consumer handed it and
+    /// told to format destroys the very table that described it.
+    ///
+    /// Always zero for MBR entries, which have no header stating a
+    /// usable range.
+    pub issues: u32,
 }
 
 /// The on-disk type-tag for the partition. For GPT this is the type GUID +

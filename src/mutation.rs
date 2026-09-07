@@ -243,6 +243,7 @@ impl PartitionSet {
             // take in this vector — that would collide with the number
             // an existing partition already answers to.
             slot: None,
+            issues: 0,
         };
         let idx = self.partitions.len();
         self.partitions.push(part);

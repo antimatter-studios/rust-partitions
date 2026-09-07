@@ -202,6 +202,7 @@ pub fn parse_all_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Pa
             label: None,
             uuid: None,
             slot: Some(i as u32),
+            issues: 0,
         });
     }
     Ok(out)

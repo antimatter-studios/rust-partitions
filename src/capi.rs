@@ -144,9 +144,21 @@ pub struct PartitionInfo {
     /// [`partitions_get`] is not the partition's number and never was.
     /// See [`crate::Partition::slot`].
     pub slot: i32,
-    /// 4 bytes of explicit padding so the struct's size is a multiple of
-    /// its 8-byte alignment on every target.
-    pub _pad3: [u8; 4],
+    /// Which of the table's own rules this entry breaks, as a set of
+    /// [`crate::gpt::entry_issue`] bits — 0 when it breaks none.
+    ///
+    /// This occupies the four bytes that used to be `_pad3`, so the
+    /// struct's size and every other field's offset are unchanged: a
+    /// consumer built against the older header reads these bytes as the
+    /// padding they were and is unaffected.
+    ///
+    /// A non-zero value does not mean the partition cannot be read. It
+    /// means the entry disagrees with the header that describes it, so a
+    /// caller should say so before acting — and
+    /// [`partitions_open_slice`] will refuse to hand out a slice for it,
+    /// because the slice for an entry sitting on LBA 1..33 covers the
+    /// GPT header and the entry array.
+    pub issues: u32,
 }
 
 // The C declaration of the struct above lives in `include/partitions.h` and
@@ -349,6 +361,7 @@ pub unsafe extern "C" fn partitions_sniff_device(
             uuid: None,
             // A whole-device probe has no table, so no slot.
             slot: None,
+            issues: 0,
         };
         match sniff::sniff(&*parent, &synthetic) {
             Ok(kind) => FsKindCode::from(kind) as i32,
@@ -390,6 +403,20 @@ pub unsafe extern "C" fn partitions_open_slice(
             return ptr::null_mut();
         }
         let raw = &l.entries[index].raw;
+        // An entry that disagrees with the header that describes it is
+        // reported by `partitions_get` and refused here, because this is
+        // the call that turns a bad entry into damage: the slice for an
+        // entry sitting on LBA 1..33 covers the GPT header and the entry
+        // array, and a consumer handed it and told to format destroys
+        // the very table it came from.
+        if raw.issues != crate::gpt::entry_issue::NONE {
+            set_last_error(format!(
+                "partitions_open_slice: the entry at index {index} {}; \
+                 read its `issues` field and decide before opening it",
+                crate::gpt::entry_issue::describe(raw.issues),
+            ));
+            return ptr::null_mut();
+        }
         let Some(length) = slice_on_device(l.parent.size_bytes(), raw.start, raw.length) else {
             set_last_error(
                 "partitions_open_slice: the partition begins past the end of the device",
@@ -483,7 +510,7 @@ fn build_info(p: &Partition, table: TableKindCode) -> PartitionInfo {
         _pad2: [0u8; 7],
         attributes,
         slot: p.slot.map_or(-1, |s| s as i32),
-        _pad3: [0u8; 4],
+        issues: p.issues,
     }
 }
 
@@ -703,6 +730,7 @@ mod tests {
             label: None,
             uuid: None,
             slot: None,
+            issues: 0,
         };
         assert_eq!(build_info(&p, TableKindCode::Gpt).slot, -1);
     }
