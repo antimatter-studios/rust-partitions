@@ -25,7 +25,12 @@ It does **not** mount anything, decode files, or write — it's a probe.
 - [x] `SliceReader` adapter — rebases offsets on a sub-range of any `BlockRead` (planned to move into `am-fs-core` since slicing is a generic block-layer concern; this crate will re-export for backwards compatibility)
 - [x] C ABI for FFI (`partitions_probe`, `partitions_count`, `partitions_table_kind`, `partitions_get`, `partitions_sniff`, `partitions_open_slice`, `partitions_list_free`; header in `include/partitions.h`)
 - [ ] LVM / LUKS / mdraid detection
-- [ ] Logical-partition (extended MBR) chain walking
+- [ ] Logical-partition (extended MBR) chain walking. Until it exists,
+      `mbr::parse` and `probe` leave the extended container itself out of
+      the list rather than reporting it as if it were one of the volumes
+      inside it. The same goes for a `0xEE` GPT-protective entry in a
+      hybrid MBR. `mbr::parse_all_entries` returns every entry for a tool
+      that wants to show the table as it is on disk.
 
 ### Write side (table mutation)
 

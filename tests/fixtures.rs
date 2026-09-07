@@ -486,3 +486,91 @@ fn a_partition_reaching_past_the_device_is_still_reported() {
         "the fixture does not actually reach past the device"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MBR entries that are not volumes
+// ---------------------------------------------------------------------------
+
+/// An extended-partition container is not a volume. Its contents are a
+/// linked list of EBRs — partition tables, not a filesystem — and this
+/// crate does not walk that chain yet.
+///
+/// Reporting the container in the same list as the real partitions is
+/// not "we do not report logical partitions yet", it is "we report the
+/// container as if it were one of them": sniffing it reads an EBR and
+/// calls it an unknown filesystem, and slicing it hands a driver the
+/// chain.
+#[test]
+fn an_extended_container_is_not_reported_as_a_volume() {
+    for container in [0x05u8, 0x0F] {
+        let dev = Bytes::new(16 * 1024 * 1024);
+        write_mbr_entry(&dev, 0, 0x83, 2048, 2048); // a real partition
+        write_mbr_entry(&dev, 1, container, 8192, 16384); // the container
+        dev.write(510, &[0x55, 0xAA]);
+
+        let (kind, parts) = probe(&dev).unwrap();
+        assert_eq!(kind, TableKind::Mbr);
+        assert_eq!(
+            parts.len(),
+            1,
+            "type {container:#04x}: the extended container was reported as a volume"
+        );
+        assert_eq!(parts[0].start, 2048 * 512);
+
+        // The container is still visible to a caller that wants the raw
+        // table rather than the volumes on it.
+        let every = partitions::mbr::parse_all_entries(&mbr_sector(&dev)).unwrap();
+        assert_eq!(every.len(), 2, "type {container:#04x}");
+        assert!(matches!(
+            every[1].kind,
+            PartitionKind::Mbr { type_byte, .. } if type_byte == container
+        ));
+    }
+}
+
+/// A hybrid MBR — a `0xEE` entry alongside real entries mirroring some
+/// of the GPT partitions — is what every bootable macOS/Windows dual-boot
+/// USB and most Linux live images carry. `is_protective` requires exactly
+/// one non-empty entry, so it says no, and the probe falls through to the
+/// MBR parser.
+///
+/// The `0xEE` entry is a marker saying "the real table is the GPT", never
+/// a volume. Handed back as a partition it spans the whole disk and
+/// overlaps every real one.
+#[test]
+fn a_hybrid_mbrs_protective_entry_is_not_reported_as_a_volume() {
+    let dev = Bytes::new(16 * 1024 * 1024);
+    let total_sectors = (16 * 1024 * 1024 / 512) as u32;
+    write_mbr_entry(&dev, 0, 0xEE, 1, total_sectors - 1);
+    write_mbr_entry(&dev, 1, 0x83, 2048, 2048);
+    write_mbr_entry(&dev, 2, 0xAF, 4096, 2048);
+    dev.write(510, &[0x55, 0xAA]);
+
+    let (kind, parts) = probe(&dev).unwrap();
+    assert_eq!(kind, TableKind::Mbr);
+    assert_eq!(
+        parts.len(),
+        2,
+        "the whole-disk 0xEE marker was reported as a volume beside the real ones"
+    );
+    for p in &parts {
+        assert!(
+            !matches!(
+                p.kind,
+                PartitionKind::Mbr {
+                    type_byte: 0xEE,
+                    ..
+                }
+            ),
+            "a 0xEE entry reached the volume list"
+        );
+    }
+}
+
+/// The first 512 bytes of a device, for the `mbr` module's own entry
+/// points.
+fn mbr_sector(dev: &Bytes) -> [u8; 512] {
+    let mut sector = [0u8; 512];
+    dev.read_at(0, &mut sector).unwrap();
+    sector
+}

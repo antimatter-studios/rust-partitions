@@ -114,9 +114,65 @@ pub fn is_protective(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> bool {
 /// where this bit is set.
 pub const STATUS_ACTIVE: u8 = 0x80;
 
-/// Parse the four primary entries. Empty entries are skipped. Extended-LBA
-/// entries are reported as-is — chain walking is not yet implemented.
+/// What an MBR entry describes.
+///
+/// Three of the four primary slots can hold something that is not a
+/// volume, and the type byte is the only thing that says which. A
+/// consumer reading the parsed list as "the volumes on this disk" has no
+/// way to tell without knowing these byte values by heart, so the
+/// distinction is named here rather than left to each caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryRole {
+    /// A partition holding data: what a caller means by "a volume".
+    Volume,
+    /// An extended-partition container (`0x05` / `0x0F`). Its contents
+    /// are a linked list of EBRs — partition tables, not a filesystem.
+    ExtendedContainer,
+    /// The `0xEE` marker that says the real table is the GPT. Spans the
+    /// whole disk and describes nothing.
+    GptProtective,
+}
+
+/// What the entry with this type byte describes. See [`EntryRole`].
+pub fn entry_role(type_byte: u8) -> EntryRole {
+    match type_byte {
+        types::EXTENDED_CHS | types::EXTENDED_LBA => EntryRole::ExtendedContainer,
+        types::GPT_PROTECTIVE => EntryRole::GptProtective,
+        _ => EntryRole::Volume,
+    }
+}
+
+/// Parse the four primary entries and return the **volumes** among them.
+///
+/// Empty and zero-length entries are skipped, and so are the entries
+/// that are not volumes: the extended-partition containers and the
+/// `0xEE` GPT-protective marker. See [`EntryRole`] for why, and
+/// [`parse_all_entries`] for the unfiltered list.
+///
+/// An extended container used to come back here, which is not "we do not
+/// report logical partitions yet" but "we report the container as if it
+/// were one of them": sniffing it reads an EBR and calls it an unknown
+/// filesystem, and slicing it hands a driver the chain. A `0xEE` entry
+/// used to come back from a hybrid MBR — one `0xEE` beside real entries,
+/// which every bootable dual-boot USB carries — as a whole-disk
+/// partition overlapping every real one.
 pub fn parse(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
+    let mut all = parse_all_entries(lba0)?;
+    all.retain(|p| match p.kind {
+        PartitionKind::Mbr { type_byte, .. } => entry_role(type_byte) == EntryRole::Volume,
+        _ => true,
+    });
+    Ok(all)
+}
+
+/// Parse the four primary entries and return **every** non-empty one,
+/// containers and markers included.
+///
+/// For a caller that wants to show the table as it is on disk rather
+/// than mount from it — a repair or inspection tool — where leaving an
+/// entry out would be its own kind of wrong answer. Use [`entry_role`]
+/// to tell them apart.
+pub fn parse_all_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
     let mut out = Vec::new();
     for i in 0..layout::ENTRY_COUNT {
         let off = layout::entry_at(i);
