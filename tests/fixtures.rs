@@ -381,6 +381,7 @@ fn sniff_through_partition_offset() {
         label: None,
         uuid: None,
         slot: None,
+        issues: 0,
     };
     let kind = sniff(&dev, &part).unwrap();
     assert_eq!(kind, FsKind::Ntfs);
@@ -615,6 +616,7 @@ fn a_partition_running_off_the_end_is_still_sniffed() {
         label: None,
         uuid: None,
         slot: Some(0),
+        issues: 0,
     };
 
     assert_eq!(
@@ -639,9 +641,472 @@ fn a_partition_beginning_past_the_end_is_still_an_error() {
         label: None,
         uuid: None,
         slot: Some(0),
+        issues: 0,
     };
     assert!(
         sniff::sniff(&dev, &part).is_err(),
         "a partition outside the device must not be classified"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GPT entries against the header's usable range, and against each other
+// ---------------------------------------------------------------------------
+
+impl fs_core::BlockDevice for Bytes {}
+
+/// A table holding the three shapes the rules exist for: a healthy
+/// entry, one overlapping it, and one sitting on top of the GPT itself.
+fn gpt_with_broken_entries(dev: &Bytes) {
+    build_gpt_with_entries(
+        dev,
+        &[
+            (type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "a"),
+            (
+                type_guids::LINUX_FILESYSTEM,
+                [2u8; 16],
+                3000,
+                5000,
+                "overlaps-a",
+            ),
+            (
+                type_guids::LINUX_FILESYSTEM,
+                [3u8; 16],
+                1,
+                33,
+                "on-top-of-the-gpt",
+            ),
+        ],
+    );
+}
+
+/// Every entry is returned, and each one says which rules it breaks.
+///
+/// Refusing the whole table would make a damaged disk unreadable as well
+/// as uneditable, which is the opposite of what somebody looking at one
+/// needs. So `probe` stays total and the policy moves up — but the
+/// caller is told, which it was not before.
+#[test]
+fn a_gpt_entry_reports_the_rules_it_breaks() {
+    use partitions::gpt::entry_issue;
+
+    let dev = Bytes::new(8 * 1024 * 1024);
+    gpt_with_broken_entries(&dev);
+
+    let (kind, parts) = probe(&dev).unwrap();
+    assert_eq!(kind, TableKind::Gpt);
+    assert_eq!(parts.len(), 3, "every entry is still returned");
+
+    assert_eq!(
+        parts[0].issues,
+        entry_issue::OVERLAPS_ANOTHER,
+        "the first entry is legal except that the second sits on it"
+    );
+    assert_eq!(
+        parts[1].issues,
+        entry_issue::OVERLAPS_ANOTHER,
+        "and so is the second, the other way round"
+    );
+    assert_eq!(
+        parts[2].issues,
+        entry_issue::BEFORE_FIRST_USABLE,
+        "LBA 1..33 is the header and the entry array, not usable space"
+    );
+
+    assert!(entry_issue::describe(parts[2].issues).contains("first usable"));
+}
+
+/// A table whose entries all obey the rules reports nothing.
+///
+/// The positive control: without it, a bug that set every bit on every
+/// entry would pass the test above.
+#[test]
+fn a_healthy_gpt_reports_no_issues() {
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[
+            (type_guids::EFI_SYSTEM, [1u8; 16], 34, 2081, "EFI"),
+            (
+                type_guids::LINUX_FILESYSTEM,
+                [2u8; 16],
+                2082,
+                4129,
+                "rootfs",
+            ),
+        ],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert!(
+        parts.iter().all(|p| p.issues == 0),
+        "a healthy table must report nothing: {:?}",
+        parts.iter().map(|p| p.issues).collect::<Vec<_>>()
+    );
+}
+
+/// An entry that ends past the last usable LBA is reported as such.
+#[test]
+fn a_gpt_entry_running_into_the_backup_table_is_reported() {
+    use partitions::gpt::entry_issue;
+
+    let dev = Bytes::new(1024 * 1024);
+    let total_sectors = 1024 * 1024 / 512;
+    // last_usable_lba is total_sectors - 34; run one sector past it.
+    build_gpt_with_entries(
+        &dev,
+        &[(
+            type_guids::LINUX_FILESYSTEM,
+            [1u8; 16],
+            34,
+            total_sectors - 33,
+            "into-the-backup",
+        )],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts[0].issues, entry_issue::PAST_LAST_USABLE);
+}
+
+/// The C ABI reports the same thing, and refuses to hand out a slice for
+/// an entry that breaks a rule.
+///
+/// This is the call that turns a bad entry into damage. The slice for
+/// the entry on LBA 1..33 is 16,896 bytes starting at 512 — the GPT
+/// header and the whole entry array — and a consumer handed it and told
+/// to format destroys the very table that described it.
+#[test]
+fn the_c_abi_reports_issues_and_refuses_a_slice_for_a_broken_entry() {
+    use partitions::capi::*;
+    use partitions::gpt::entry_issue;
+    use std::ptr;
+    use std::sync::Arc;
+
+    let dev = Bytes::new(8 * 1024 * 1024);
+    gpt_with_broken_entries(&dev);
+    let handle = fs_core::ffi::FsCoreDevice::into_handle(Arc::new(dev));
+
+    let mut list: *mut PartitionList = ptr::null_mut();
+    let rc = unsafe { partitions_probe(handle, &mut list) };
+    assert_eq!(rc, fs_core::ffi::FsCoreErrorCode::Ok);
+    assert_eq!(unsafe { partitions_count(list) }, 3);
+
+    let mut info = std::mem::MaybeUninit::<PartitionInfo>::uninit();
+    let rc = unsafe { partitions_get(list, 2, info.as_mut_ptr()) };
+    assert_eq!(rc, fs_core::ffi::FsCoreErrorCode::Ok);
+    let info = unsafe { info.assume_init() };
+    assert_eq!(info.issues, entry_issue::BEFORE_FIRST_USABLE);
+    assert_eq!(info.start, 512, "the slice would start at the GPT header");
+
+    // The healthy-but-overlapped entry is refused too, and the sound
+    // arithmetic of its slice is not the point: acting on either half of
+    // an overlapping pair writes over the other.
+    for index in 0..3 {
+        let slice = unsafe { partitions_open_slice(list, index) };
+        assert!(
+            slice.is_null(),
+            "index {index} breaks a rule and must not be opened"
+        );
+    }
+
+    unsafe { partitions_list_free(list) };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+}
+
+/// A slice is still handed out for an entry that breaks nothing.
+#[test]
+fn the_c_abi_still_opens_a_slice_for_a_sound_entry() {
+    use partitions::capi::*;
+    use std::ptr;
+    use std::sync::Arc;
+
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[(type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "sound")],
+    );
+    let handle = fs_core::ffi::FsCoreDevice::into_handle(Arc::new(dev));
+
+    let mut list: *mut PartitionList = ptr::null_mut();
+    assert_eq!(
+        unsafe { partitions_probe(handle, &mut list) },
+        fs_core::ffi::FsCoreErrorCode::Ok
+    );
+    let slice = unsafe { partitions_open_slice(list, 0) };
+    assert!(!slice.is_null(), "a sound entry must still open");
+
+    unsafe { fs_core::ffi::fs_core_device_close(slice) };
+    unsafe { partitions_list_free(list) };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+}
+
+/// A `Bytes` that accepts writes, for the commit half of a round trip.
+struct WritableBytes(Bytes);
+
+impl BlockRead for WritableBytes {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.0.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        self.0.size_bytes()
+    }
+}
+impl fs_core::BlockDevice for WritableBytes {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        self.0.write(offset as usize, buf);
+        Ok(())
+    }
+    fn flush(&self) -> fs_core::Result<()> {
+        Ok(())
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+/// Whatever `probe` returns for a damaged table, `commit` accepts back
+/// once the caller has removed the entries the table itself says are
+/// wrong.
+///
+/// This is the part a user actually runs into. The reader and the writer
+/// disagreed about what a legal table is, so a disk in this state could
+/// not be edited at all: measured before the change, removing either one
+/// of the two illegal entries still failed to commit, and the error named
+/// the other one —
+///
+/// ```text
+/// remove the overlapping entry -> commit Err("partition starts before first usable LBA")
+/// remove the on-top-of-GPT one -> commit Err("partitions overlap")
+/// ```
+///
+/// — with nothing in what `probe` returned to say which entries those
+/// were. Now the entries say so themselves, so "remove what the table
+/// reports as broken" is a rule a caller can follow.
+#[test]
+fn removing_exactly_the_entries_that_report_issues_makes_the_table_committable() {
+    use partitions::{PartitionRef, PartitionSet};
+
+    let dev = WritableBytes(Bytes::new(8 * 1024 * 1024));
+    gpt_with_broken_entries(&dev.0);
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.partitions.len(), 3);
+
+    // Remove every entry the table reports as broken, highest index
+    // first so the earlier indices stay valid.
+    let broken: Vec<usize> = set
+        .partitions
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.issues != 0)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(broken, vec![0, 1, 2], "all three are implicated");
+    for &i in broken.iter().rev() {
+        set.remove(PartitionRef::Index(i)).unwrap();
+    }
+
+    set.commit(&dev).expect("the remaining table must commit");
+
+    // And the disk reads back as what was left.
+    let (kind, parts) = probe(&dev).unwrap();
+    assert_eq!(kind, TableKind::Gpt);
+    assert!(parts.is_empty());
+}
+
+/// The narrower version of the same round trip: one sound entry among
+/// the broken ones survives.
+#[test]
+fn a_sound_entry_survives_removing_the_broken_ones() {
+    use partitions::{PartitionRef, PartitionSet};
+
+    let dev = WritableBytes(Bytes::new(8 * 1024 * 1024));
+    build_gpt_with_entries(
+        &dev.0,
+        &[
+            (type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "sound"),
+            (
+                type_guids::LINUX_FILESYSTEM,
+                [2u8; 16],
+                1,
+                33,
+                "on-top-of-the-gpt",
+            ),
+        ],
+    );
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let broken: Vec<usize> = set
+        .partitions
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.issues != 0)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(broken, vec![1], "only the second entry breaks a rule");
+    set.remove(PartitionRef::Index(1)).unwrap();
+    set.commit(&dev).expect("the sound entry must commit");
+
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].label.as_deref(), Some("sound"));
+    assert_eq!(parts[0].issues, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Each rule, pinned on its own
+//
+// The three-entry fixture above exercises the whole set at once, which
+// is not the same as exercising each mechanism. These four reach the
+// cases it cannot: a nested entry the sorted-neighbour pass alone would
+// miss, the start-wraps-the-end hazard, and the last value each bound
+// must accept.
+// ---------------------------------------------------------------------------
+
+/// An entry entirely inside another, not adjacent to it once sorted by
+/// start, is still an overlap.
+///
+/// Sorted by start the entries are X(100..10000), Y(200..300),
+/// Z(9000..9100). The neighbour pairs are (X, Y), which overlap, and
+/// (Y, Z), which do not — 9000 is past 300. Z sits wholly inside X and
+/// no neighbour pair says so, which is why `mark_overlaps` carries the
+/// highest end seen so far as well as the previous one.
+#[test]
+fn an_entry_nested_inside_another_is_reported_as_overlapping() {
+    use partitions::gpt::entry_issue;
+
+    let dev = Bytes::new(16 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[
+            (type_guids::LINUX_FILESYSTEM, [1u8; 16], 100, 10_000, "long"),
+            (type_guids::LINUX_FILESYSTEM, [2u8; 16], 200, 300, "early"),
+            (
+                type_guids::LINUX_FILESYSTEM,
+                [3u8; 16],
+                9_000,
+                9_100,
+                "swallowed",
+            ),
+        ],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert!(
+        parts[2].issues & entry_issue::OVERLAPS_ANOTHER != 0,
+        "the entry nested inside the long one must be reported: issues={:#x}",
+        parts[2].issues
+    );
+    assert!(
+        parts[0].issues & entry_issue::OVERLAPS_ANOTHER != 0,
+        "and so must the one it is nested in"
+    );
+}
+
+/// Two entries sharing exactly one sector overlap.
+///
+/// The last value that is still an overlap, and the one a `<=` written
+/// as `<` would let through — touching by a single sector is the shape
+/// an off-by-one in a partition editor produces.
+#[test]
+fn two_entries_sharing_exactly_one_sector_overlap() {
+    use partitions::gpt::entry_issue;
+
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[
+            (type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "first"),
+            (
+                type_guids::LINUX_FILESYSTEM,
+                [2u8; 16],
+                4095,
+                6000,
+                "touching",
+            ),
+        ],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts[0].issues, entry_issue::OVERLAPS_ANOTHER);
+    assert_eq!(parts[1].issues, entry_issue::OVERLAPS_ANOTHER);
+}
+
+/// Two entries that merely abut do not overlap.
+///
+/// The first value that is not an overlap, so the pair with the test
+/// above bounds the rule from both sides: a `<=` written as `<` fails
+/// the one, and a `<` written as `<=` fails this one, which would
+/// report every back-to-back partition on a healthy disk.
+#[test]
+fn two_entries_that_merely_abut_do_not_overlap() {
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[
+            (type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "first"),
+            (type_guids::LINUX_FILESYSTEM, [2u8; 16], 4096, 6000, "next"),
+        ],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert!(
+        parts.iter().all(|p| p.issues == 0),
+        "back-to-back partitions are the normal shape of a disk: {:?}",
+        parts.iter().map(|p| p.issues).collect::<Vec<_>>()
+    );
+}
+
+/// An entry ending on exactly the last usable LBA is legal.
+///
+/// The last value the upper bound must accept. Without it, `end_lba >
+/// last_usable` written as `>=` — one sector too strict — would reject
+/// the last partition on every fully-allocated disk, with a green
+/// suite.
+#[test]
+fn an_entry_ending_on_the_last_usable_lba_is_legal() {
+    let dev = Bytes::new(1024 * 1024);
+    let total_sectors = 1024 * 1024 / 512;
+    let last_usable = total_sectors - 34;
+    build_gpt_with_entries(
+        &dev,
+        &[(
+            type_guids::LINUX_FILESYSTEM,
+            [1u8; 16],
+            34,
+            last_usable,
+            "right-up-to-the-edge",
+        )],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(
+        parts[0].issues, 0,
+        "an entry ending on the last usable LBA breaks nothing"
+    );
+}
+
+/// An entry that starts well past the disk is reported rather than
+/// hidden.
+///
+/// The far-outside case, which is what a stale table left by a shrink
+/// looks like. It is deliberately not the boundary case — that is
+/// `an_entry_ending_on_the_last_usable_lba_is_legal` above, and the two
+/// together bound the rule.
+#[test]
+fn an_entry_starting_past_the_disk_is_reported() {
+    use partitions::gpt::entry_issue;
+
+    let dev = Bytes::new(1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[(
+            type_guids::LINUX_FILESYSTEM,
+            [1u8; 16],
+            1_000_000,
+            1_000_001,
+            "past-the-end",
+        )],
+    );
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(
+        parts.len(),
+        1,
+        "the entry is still returned, so the caller can see it"
+    );
+    assert_eq!(parts[0].issues, entry_issue::PAST_LAST_USABLE);
 }

@@ -182,6 +182,111 @@ pub struct Header {
     pub header_size: u32,
 }
 
+/// The rules a GPT entry has to satisfy, named so that a caller can be
+/// told which one an entry breaks.
+///
+/// These existed once, in the writer. `gpt_write` refused a partition
+/// starting before `first_usable_lba` or ending past `last_usable_lba`,
+/// and refused an overlapping pair; the reader applied neither, so the
+/// two disagreed about what a legal table is. `probe` handed back
+/// entries that `commit` then refused, and a user could not edit such a
+/// disk at all without first working out which entries were illegal —
+/// with nothing telling them which. Measured on a table holding an
+/// overlapping pair and an entry on LBA 1..33:
+///
+/// ```text
+/// remove the overlapping entry  -> commit Err("partition starts before first usable LBA")
+/// remove the on-top-of-GPT one  -> commit Err("partitions overlap")
+/// remove both                   -> commit Ok(())
+/// ```
+///
+/// So the rules live here now and both sides call them.
+pub mod entry_issue {
+    /// The entry breaks none of the rules.
+    pub const NONE: u32 = 0;
+    /// Starts before the header's `first_usable_lba` — inside the
+    /// protective MBR, the header itself, or the entry array.
+    pub const BEFORE_FIRST_USABLE: u32 = 1 << 0;
+    /// Ends past the header's `last_usable_lba` — inside the backup
+    /// entry array or the backup header.
+    pub const PAST_LAST_USABLE: u32 = 1 << 1;
+    /// Shares at least one sector with another entry in the same table.
+    pub const OVERLAPS_ANOTHER: u32 = 1 << 2;
+
+    /// Every bit this crate defines. A bit outside this is not one of
+    /// ours.
+    pub const ALL: u32 = BEFORE_FIRST_USABLE | PAST_LAST_USABLE | OVERLAPS_ANOTHER;
+
+    /// The rules `issues` breaks, in words, for an error message a
+    /// person reads.
+    pub fn describe(issues: u32) -> String {
+        let mut parts = Vec::new();
+        if issues & BEFORE_FIRST_USABLE != 0 {
+            parts.push("starts before the first usable LBA");
+        }
+        if issues & PAST_LAST_USABLE != 0 {
+            parts.push("ends past the last usable LBA");
+        }
+        if issues & OVERLAPS_ANOTHER != 0 {
+            parts.push("overlaps another partition");
+        }
+        if parts.is_empty() {
+            return "no issues".to_string();
+        }
+        parts.join(", ")
+    }
+}
+
+/// Which of the header's usable-range rules the inclusive LBA span
+/// `[start_lba, end_lba]` breaks.
+pub fn range_issues(start_lba: u64, end_lba: u64, first_usable: u64, last_usable: u64) -> u32 {
+    let mut issues = entry_issue::NONE;
+    if start_lba < first_usable {
+        issues |= entry_issue::BEFORE_FIRST_USABLE;
+    }
+    // The start needs its own upper bound, not only the end's: a start
+    // far enough out makes the end wrap to something small, which the
+    // end test would then wave through.
+    if start_lba > last_usable || end_lba > last_usable {
+        issues |= entry_issue::PAST_LAST_USABLE;
+    }
+    issues
+}
+
+/// Which entries in `spans` share a sector with another entry.
+///
+/// `spans` are inclusive `(first_lba, last_lba)` pairs in the order the
+/// entries appear in the table; the returned vector is in the same
+/// order. One sort of the indices, one linear pass.
+pub fn mark_overlaps(spans: &[(u64, u64)]) -> Vec<bool> {
+    let mut flags = vec![false; spans.len()];
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|&i| spans[i].0);
+    for w in order.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if spans[b].0 <= spans[a].1 {
+            flags[a] = true;
+            flags[b] = true;
+        }
+    }
+    // A sorted-neighbour pass misses a short entry entirely swallowed by
+    // a long one two places back, so carry the highest end seen so far.
+    let mut highest_end: Option<(usize, u64)> = None;
+    for &i in &order {
+        if let Some((j, end)) = highest_end {
+            if spans[i].0 <= end {
+                flags[i] = true;
+                flags[j] = true;
+            }
+        }
+        match highest_end {
+            Some((_, end)) if end >= spans[i].1 => {}
+            _ => highest_end = Some((i, spans[i].1)),
+        }
+    }
+    flags
+}
+
 /// Parse and CRC-validate a GPT header sector. Does not touch the entry array.
 pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
     if &sector[header_offsets::SIGNATURE..header_offsets::SIGNATURE + 8] != SIGNATURE {
@@ -303,6 +408,7 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
 
     let entry_size = header.partition_entry_size as usize;
     let mut out = Vec::new();
+    let mut spans: Vec<(u64, u64)> = Vec::new();
     for i in 0..header.num_partition_entries as usize {
         let off = i * entry_size;
         let type_guid: [u8; 16] = array[off..off + 16].try_into().unwrap();
@@ -346,8 +452,36 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
             label,
             uuid: Some(unique_guid),
             slot: Some(i as u32),
+            // Filled in below, once every entry has been read: the
+            // overlap rule is about the set, not the entry.
+            issues: entry_issue::NONE,
         });
+        spans.push((start_lba, end_lba));
     }
+
+    // The header's own usable range, and the entries against each other.
+    //
+    // Reported rather than refused. Refusing the whole table would make
+    // a damaged disk unreadable as well as uneditable, which is the
+    // opposite of what somebody looking at one needs; per-entry flags
+    // keep `probe` total and let a caller say which entry is wrong and
+    // about what. What stops a caller acting on one unknowingly is
+    // `partitions_open_slice`, which refuses to hand out a slice for an
+    // entry with issues.
+    for (p, span) in out.iter_mut().zip(&spans) {
+        p.issues = range_issues(
+            span.0,
+            span.1,
+            header.first_usable_lba,
+            header.last_usable_lba,
+        );
+    }
+    for (p, overlaps) in out.iter_mut().zip(mark_overlaps(&spans)) {
+        if overlaps {
+            p.issues |= entry_issue::OVERLAPS_ANOTHER;
+        }
+    }
+
     Ok((out, array))
 }
 
@@ -455,4 +589,112 @@ fn parse_utf16_label(bytes: &[u8]) -> Option<String> {
     // tells a user more than an empty name does, and nothing computes on
     // a partition label.
     Some(String::from_utf16_lossy(&units))
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::{entry_issue, mark_overlaps, range_issues};
+
+    /// The usable-range rule, at both edges.
+    ///
+    /// The integration fixtures reach the outside cases; a bound is only
+    /// pinned by the last value it accepts and the first it refuses, and
+    /// those are here where they can be stated without building a disk
+    /// around them.
+    #[test]
+    fn the_usable_range_is_inclusive_at_both_ends() {
+        // Exactly on each edge: legal.
+        assert_eq!(range_issues(34, 2014, 34, 2014), entry_issue::NONE);
+        // One sector outside each edge: not.
+        assert_eq!(
+            range_issues(33, 2014, 34, 2014),
+            entry_issue::BEFORE_FIRST_USABLE
+        );
+        assert_eq!(
+            range_issues(34, 2015, 34, 2014),
+            entry_issue::PAST_LAST_USABLE
+        );
+        // Both at once.
+        assert_eq!(
+            range_issues(33, 2015, 34, 2014),
+            entry_issue::BEFORE_FIRST_USABLE | entry_issue::PAST_LAST_USABLE
+        );
+    }
+
+    /// The start is bounded above as well as below, and this is the only
+    /// test that says so.
+    ///
+    /// Both of this function's callers establish `end >= start` before
+    /// they get here — the reader refuses `ending_lba < starting_lba`
+    /// outright, and the writer's length is a non-zero multiple of a
+    /// sector — so a start past the last usable LBA always drags its end
+    /// past it too, and no fixture can isolate this clause. It is kept
+    /// because the function's contract is about a span, not about what
+    /// its callers happen to have checked first: a caller that has not
+    /// established the ordering, or a `sector_span` whose arithmetic
+    /// wrapped, hands over a span whose end is small and whose start is
+    /// absurd, and the end test alone waves it through.
+    #[test]
+    fn a_start_past_the_last_usable_lba_is_reported_even_when_the_end_is_not() {
+        assert_eq!(
+            range_issues(9_000, 10, 34, 2014),
+            entry_issue::PAST_LAST_USABLE,
+            "the end is inside the disk; the start is not"
+        );
+    }
+
+    /// Overlap is about sharing a sector, so touching by one sector
+    /// counts and abutting does not.
+    #[test]
+    fn overlap_is_bounded_at_the_shared_sector() {
+        // Share exactly one sector.
+        assert_eq!(mark_overlaps(&[(100, 200), (200, 300)]), vec![true, true]);
+        // Abut: the normal shape of a partitioned disk.
+        assert_eq!(mark_overlaps(&[(100, 200), (201, 300)]), vec![false, false]);
+        // Nothing at all.
+        assert_eq!(
+            mark_overlaps(&[(100, 200), (900, 1000)]),
+            vec![false, false]
+        );
+    }
+
+    /// An entry wholly inside another is an overlap even when the two
+    /// are not neighbours once sorted by start.
+    ///
+    /// Sorted, these are X(100..10000), Y(200..300), Z(9000..9100). The
+    /// neighbour pairs are (X, Y) — overlapping — and (Y, Z), which do
+    /// not overlap, since 9000 is past 300. Z is nonetheless wholly
+    /// inside X. A single-pass sorted-neighbour scan reports
+    /// `[true, true, false]` and calls the nested entry clean, which is
+    /// why the second pass carries the highest end seen so far rather
+    /// than only the previous one.
+    #[test]
+    fn an_entry_nested_inside_a_longer_one_is_an_overlap() {
+        assert_eq!(
+            mark_overlaps(&[(100, 10_000), (200, 300), (9_000, 9_100)]),
+            vec![true, true, true]
+        );
+    }
+
+    /// Order in the table does not change the answer.
+    ///
+    /// `mark_overlaps` sorts indices rather than spans, so the returned
+    /// flags are in the caller's order. Reversing the input must reverse
+    /// the output and nothing else.
+    #[test]
+    fn the_answer_does_not_depend_on_the_order_of_the_entries() {
+        assert_eq!(
+            mark_overlaps(&[(9_000, 9_100), (200, 300), (100, 10_000)]),
+            vec![true, true, true]
+        );
+        assert_eq!(mark_overlaps(&[(201, 300), (100, 200)]), vec![false, false]);
+    }
+
+    /// A table with nothing in it, and a table with one entry, have no
+    /// overlaps — the windows(2) pass has no pairs to look at.
+    #[test]
+    fn a_table_too_small_to_have_a_pair_has_no_overlaps() {
+        assert_eq!(mark_overlaps(&[]), Vec::<bool>::new());
+        assert_eq!(mark_overlaps(&[(100, 200)]), vec![false]);
+    }
 }

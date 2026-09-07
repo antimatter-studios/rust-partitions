@@ -89,8 +89,38 @@ typedef struct {
                                      * A table with a hole in it is routine,
                                      * so the index passed to partitions_get
                                      * is not the partition's number */
-    uint8_t        _pad3[4];        /* alignment */
+    uint32_t       issues;          /* which of the table's own rules this
+                                     * entry breaks, as PartitionsEntryIssue
+                                     * bits; 0 when it breaks none. Occupies
+                                     * what used to be four bytes of padding,
+                                     * so the struct's size and every other
+                                     * field's offset are unchanged. A
+                                     * non-zero value does not mean the
+                                     * partition cannot be read; it means the
+                                     * entry disagrees with the header that
+                                     * describes it, and partitions_open_slice
+                                     * will refuse it */
 } PartitionInfo;
+
+/* -------------------------------------------------------------------------
+ * PartitionInfo.issues bits.
+ *
+ * A partition table is bytes off a disk, so an entry that breaks a rule is
+ * an ordinary thing to be handed. They are reported per entry rather than
+ * refusing the whole table, because refusing would make a damaged disk
+ * unreadable as well as uneditable — which is the opposite of what somebody
+ * looking at one needs.
+ * ------------------------------------------------------------------------- */
+
+#define PARTITIONS_ENTRY_OK                    0u
+/* Starts before the header's first usable LBA — inside the protective MBR,
+ * the GPT header itself, or the entry array. */
+#define PARTITIONS_ENTRY_BEFORE_FIRST_USABLE   (1u << 0)
+/* Ends past the header's last usable LBA — inside the backup entry array or
+ * the backup header. */
+#define PARTITIONS_ENTRY_PAST_LAST_USABLE      (1u << 1)
+/* Shares at least one sector with another entry in the same table. */
+#define PARTITIONS_ENTRY_OVERLAPS_ANOTHER      (1u << 2)
 
 /* -------------------------------------------------------------------------
  * Opaque PartitionList. Allocated by partitions_probe, freed via
