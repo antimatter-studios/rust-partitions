@@ -1471,3 +1471,65 @@ fn a_backup_that_agrees_in_every_field_is_still_ok() {
     edit_backup_entries(&dev, |_| {});
     assert_eq!(gpt::validate_backup(&dev, &primary), BackupStatus::Ok);
 }
+
+/// A geometry the writer refuses must not have written anything.
+///
+/// `write_gpt_with_geometry` lays down the protective MBR at LBA 0 and
+/// the primary header at LBA 1 before it touches the entry array. With
+/// an `entry_lba` near `u64::MAX` the geometry's arithmetic wrapped in
+/// a release build — `first_possible` came out as 31, below the
+/// device's sector count, so the `DeviceTooSmall` refusal was stepped
+/// over — and the failure arrived later, at the array write, *after*
+/// those two sectors had been rewritten. The caller was handed an
+/// `Err` and a torn table: the disk's own header gone, and no new one
+/// in its place.
+///
+/// That is why the refusal belongs in the shape check rather than in
+/// checked arithmetic at the point of use. Checked arithmetic turns the
+/// wrap into an error and leaves the ordering exactly as it was.
+///
+/// The assertion is on the bytes, not on the error: a test that only
+/// checked for `Err` passed before this change, in both profiles.
+#[test]
+fn a_refused_geometry_leaves_the_first_two_sectors_alone() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("root".into()),
+    )
+    .unwrap();
+    set.commit(&dev).expect("a canonical table to damage");
+
+    let mut before = [0u8; 1024];
+    dev.read_at(0, &mut before).unwrap();
+    assert_eq!(&before[510..512], &[0x55, 0xAA], "no MBR to preserve");
+
+    let hostile = GptGeometry {
+        entry_lba: u64::MAX,
+        ..GptGeometry::canonical()
+    };
+    let outcome = gpt_write::write_gpt_with_geometry(&dev, &[], [0x77u8; 16], hostile);
+    assert!(
+        outcome.is_err(),
+        "a geometry whose LBAs have no byte offset was accepted"
+    );
+
+    let mut after = [0u8; 1024];
+    dev.read_at(0, &mut after).unwrap();
+    assert_eq!(
+        &after[..],
+        &before[..],
+        "the protective MBR or the primary header was rewritten before the refusal, \
+         so the caller has an error and a torn table"
+    );
+
+    // And the table that was there still parses, which is the thing a
+    // byte comparison is standing in for.
+    let (kind, parts) = probe(&dev).expect("the original table survived");
+    assert_eq!(kind, TableKind::Gpt);
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].label.as_deref(), Some("root"));
+}
