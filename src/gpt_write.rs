@@ -102,13 +102,28 @@ pub fn write_gpt(
         array[off + 40..off + 48].copy_from_slice(&end_lba.to_le_bytes());
         array[off + 48..off + 56].copy_from_slice(&attributes.to_le_bytes());
         if let Some(label) = &p.label {
-            // 72 bytes UTF-16 LE, zero-padded; truncate at 36 code units.
+            // 72 bytes UTF-16 LE, zero-padded.
+            //
+            // TRUNCATED BY CHARACTER, NOT BY CODE UNIT. The field holds
+            // 36 UTF-16 units and a character outside the basic
+            // multilingual plane takes two of them, so cutting at 36
+            // units can leave a lone high surrogate on disk. That is not
+            // a shortened label: it is not valid UTF-16 at all, and a
+            // reader that decodes strictly answers "no label" — the name
+            // disappears rather than losing its last character.
             let name_off = off + 56;
-            for (j, c) in label.encode_utf16().enumerate() {
-                if j * 2 + 2 > 72 {
+            let mut written = 0usize;
+            for c in label.chars() {
+                let units = c.len_utf16();
+                if (written + units) * 2 > 72 {
                     break;
                 }
-                array[name_off + j * 2..name_off + j * 2 + 2].copy_from_slice(&c.to_le_bytes());
+                let mut buf = [0u16; 2];
+                for (k, u) in c.encode_utf16(&mut buf).iter().enumerate() {
+                    let at = name_off + (written + k) * 2;
+                    array[at..at + 2].copy_from_slice(&u.to_le_bytes());
+                }
+                written += units;
             }
         }
     }

@@ -8,6 +8,17 @@ never does.
 
 ### Fixed
 
+- **A GPT label is no longer dropped for the sake of its last
+  character.** The name field holds 36 UTF-16 code units and a character
+  outside the basic multilingual plane takes two of them, so cutting at
+  36 units left a lone high surrogate on disk — not a shortened label but
+  one that is not valid UTF-16 at all. The reader decoded strictly and
+  answered `None`, so a 35-character name ending in an emoji came back as
+  a partition with no name and nothing said why. The writer now truncates
+  at a character boundary, and the reader shows what is readable of a
+  name some other writer cut mid-pair rather than throwing all of it
+  away.
+
 - **A commit no longer renumbers the disk.** A partition's slot in the
   on-disk table is its identity to everything above this crate — the `3`
   in `/dev/sda3`, the `s3` in `disk4s3` — and it was dropped on the way
