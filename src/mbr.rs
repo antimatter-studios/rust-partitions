@@ -19,9 +19,23 @@
 //!   12..16  number of sectors  (u32 little-endian)
 //! ```
 //!
-//! Sector size is assumed to be 512 bytes. Real-world hardware with 4K
-//! sectors stores LBAs in 512-byte units in the MBR for compatibility, so
-//! this assumption holds.
+//! Sector size is assumed to be 512 bytes, and that is the *logical*
+//! sector size rather than the physical one. It holds for 512n and for
+//! 512e — 4 KiB physical, 512-byte logical — which between them are the
+//! large majority of consumer disks, and which is presumably what the
+//! sentence this replaces meant.
+//!
+//! IT DOES NOT HOLD FOR 4Kn, whose logical block size is 4096; that is
+//! the entire reason 4Kn exists, and it is why a 4Kn MBR can address
+//! 16 TiB rather than 2 TiB. Enterprise SAS and SATA drives, many NVMe
+//! devices under a non-default namespace format, and images made for
+//! them are all 4Kn.
+//!
+//! On such a disk every offset this module computes is eight times too
+//! small, and nothing here can tell: an MBR carries no field saying
+//! what its LBAs count in. `probe` catches the GPT case by finding a
+//! header at byte 4096; there is no equivalent signal for MBR. A caller
+//! that knows its disk is 4Kn must not use these offsets.
 
 use crate::error::{Error, Result};
 use crate::probe::{Partition, PartitionKind};

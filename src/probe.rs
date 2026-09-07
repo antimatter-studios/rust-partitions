@@ -141,6 +141,36 @@ impl Partition {
     }
 }
 
+/// Byte offset of LBA 1 on a disk whose logical sectors are 4096 bytes.
+const FOUR_K_LBA1: u64 = 4096;
+
+/// Whether the device carries a GPT header where a 4Kn disk would put
+/// one, having already failed to find one at byte 512.
+///
+/// Three things have to agree before this says yes, because the answer
+/// turns a healthy disk into a refusal and a wrong yes would be worse
+/// than the bug it replaces:
+///
+/// * a GPT signature at byte 4096, which on a 512-byte-sector disk is
+///   inside the entry array and could in principle be an entry's type
+///   GUID;
+/// * a header whose own CRC-32 checks out, which random bytes will not
+///   satisfy;
+/// * `my_lba == 1`, which is what a header at byte 4096 says about
+///   itself only when LBA 1 *is* byte 4096.
+///
+/// Returns the message rather than a bool so the reason travels with
+/// the refusal.
+fn looks_like_4kn_gpt(dev: &dyn BlockRead) -> Option<&'static str> {
+    let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
+    dev.read_at(FOUR_K_LBA1, &mut sector).ok()?;
+    let header = gpt::parse_header(&sector).ok()?;
+    if header.my_lba != 1 {
+        return None;
+    }
+    Some("this disk keeps its GPT at byte 4096, so its logical sectors are 4096 bytes (4Kn); this crate reads partition tables in 512-byte units only")
+}
+
 /// Probe the device. Returns `(table_kind, partitions)` on success.
 ///
 /// Order of attempts:
@@ -165,6 +195,24 @@ pub fn probe(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>)> {
     if has_gpt_sig {
         let parts = gpt::parse(dev, &lba1)?;
         return Ok((TableKind::Gpt, parts));
+    }
+
+    // A 4Kn disk keeps its GPT where 4096-byte LBAs put it.
+    //
+    // On such a disk LBA 1 begins at byte 4096, so byte 512 is still
+    // inside LBA 0 — the tail of the protective MBR, all zeros — and
+    // the signature test above finds nothing. LBA 0 does carry a
+    // protective MBR, because the MBR structure lives in the first 512
+    // bytes of the block whatever the block size, so the next branch
+    // used to report a perfectly healthy 4Kn disk as
+    // `GptCorrupt("protective MBR present but no GPT signature")`.
+    //
+    // Reading it properly means threading a sector size through every
+    // offset in this crate, which is a real piece of work and is not
+    // this. Saying which disk it is beats describing a corruption that
+    // is not there.
+    if let Some(why) = looks_like_4kn_gpt(dev) {
+        return Err(Error::UnsupportedSectorSize(why));
     }
 
     if has_mbr_sig {

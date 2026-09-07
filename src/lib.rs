@@ -14,11 +14,32 @@
 /// Bytes in a logical sector.
 ///
 /// This crate reads and writes partition tables in 512-byte units
-/// throughout, which is what both table formats specify their LBAs in.
-/// It is deliberately not a parameter: a table on a 4Kn device still
-/// counts its LBAs in the device's own sectors, and supporting that
-/// would mean threading a sector size through every offset calculation
-/// rather than changing this number.
+/// throughout. That is the *logical* sector size of a 512n or 512e
+/// disk, which is the large majority of them, and it is what both
+/// table formats count their LBAs in on such a disk.
+///
+/// It is deliberately not a parameter. A table on a 4Kn disk — 4096-byte
+/// logical sectors — counts its LBAs in 4096-byte units, and reading
+/// one properly would mean threading a sector size through every offset
+/// calculation rather than changing this number.
+///
+/// The consequence, stated rather than implied, because the two halves
+/// differ:
+///
+/// * A **4Kn GPT** disk is refused by name.
+///   [`probe`](crate::probe) looks for a valid GPT header at byte 4096
+///   and returns [`Error::UnsupportedSectorSize`](crate::Error) when it
+///   finds one, because without that check the disk was reported as
+///   `GptCorrupt("protective MBR present but no GPT signature")` — a
+///   healthy disk described as a broken table.
+/// * A **4Kn MBR** disk cannot be detected at all. An MBR carries
+///   nothing that says what its LBAs count in, so the entries are read
+///   as 512-byte indices and every offset comes out eight times too
+///   small, with no complaint. Measured on a 4Kn entry naming LBA 2048:
+///   reported at byte 1048576, where the truth is 8388608. That is the
+///   worse of the two failures and there is no fix for it short of the
+///   sector size being threaded through — or a caller that knows its
+///   disk's geometry telling this crate.
 ///
 /// It used to be declared three times — `gpt`, `mbr` and `mutation`
 /// each had their own — with the literal `512` written out at eight
