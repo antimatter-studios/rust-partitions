@@ -849,3 +849,233 @@ fn patch_entry_name_and_repair_crcs(dev: &MemDev, name_off: usize, name: &[u8]) 
     let header_crc = crc32fast::hash(&b[512..512 + header_size]);
     b[512 + 16..512 + 20].copy_from_slice(&header_crc.to_le_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// A commit that changed nothing must leave the table it read alone
+// ---------------------------------------------------------------------------
+
+/// Plant one primary entry directly in LBA 0, the way a disk that this
+/// crate did not write carries it.
+fn plant_mbr_entry(dev: &MemDev, slot: usize, type_byte: u8, start_lba: u32, sectors: u32) {
+    let mut b = dev.0.lock().unwrap();
+    let off = 446 + slot * 16;
+    b[off + 4] = type_byte;
+    b[off + 8..off + 12].copy_from_slice(&start_lba.to_le_bytes());
+    b[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
+    b[510] = 0x55;
+    b[511] = 0xAA;
+}
+
+/// The four entries as they are on disk: 446..510, the bytes a commit is
+/// allowed to rewrite and not allowed to lose.
+fn mbr_table(dev: &MemDev) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    dev.read_at(446, &mut out).unwrap();
+    out
+}
+
+/// A round trip that changes nothing must change nothing on disk.
+///
+/// `probe` returns the volumes, deliberately leaving out the extended
+/// container: it is a chain of partition tables rather than a
+/// filesystem, and reporting it as a volume made sniffing read an EBR
+/// and call it an unknown filesystem. `commit` then builds a fresh,
+/// all-zero sector and writes only the partitions it was handed, so the
+/// entry the filter dropped is not written back. The container's slot
+/// comes back as type `0x00`, the EBR chain behind it is still on disk
+/// with nothing pointing at it, and every logical partition on the disk
+/// is gone as far as any tool is concerned. `commit` returns `Ok(())`.
+///
+/// Measured before the fix:
+///
+/// ```text
+/// slot1 type before = 0x0f
+/// from_probe saw 1 partitions
+/// slot1 type after  = 0x00
+/// ```
+#[test]
+fn a_commit_that_changed_nothing_keeps_the_extended_container() {
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0x83, 2048, 2048);
+    // 0x0F: an extended container, LBA-addressed. Its contents are EBRs.
+    plant_mbr_entry(&dev, 1, 0x0F, 8192, 16384);
+
+    let before = mbr_table(&dev);
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+    let after = mbr_table(&dev);
+
+    assert_eq!(
+        after,
+        before,
+        "a commit that changed nothing rewrote the table; \
+         slot 1 type is {:#04x} where it was {:#04x}",
+        after[16 + 4],
+        before[16 + 4]
+    );
+}
+
+/// The same round trip on a hybrid MBR, which is what a bootable
+/// macOS/Windows USB and most Linux live images carry: a `0xEE` marker
+/// beside real entries. Losing it stops firmware taking the hybrid path
+/// from seeing the disk as GPT-backed.
+///
+/// The marker is in slot 0 here and the container above was in slot 1,
+/// so between them the entry that has to survive is neither always the
+/// first nor always after the volumes.
+#[test]
+fn a_commit_that_changed_nothing_keeps_a_hybrid_mbrs_marker() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let total_sectors = (DISK_64M / 512) as u32;
+    plant_mbr_entry(&dev, 0, 0xEE, 1, total_sectors - 1);
+    plant_mbr_entry(&dev, 1, 0x83, 2048, 2048);
+    plant_mbr_entry(&dev, 2, 0xAF, 4096, 2048);
+
+    let before = mbr_table(&dev);
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+    let after = mbr_table(&dev);
+
+    assert_eq!(
+        after, before,
+        "a commit that changed nothing rewrote the table; \
+         slot 0 type is {:#04x} where it was {:#04x}",
+        after[4], before[4]
+    );
+}
+
+/// An entry `parse` skipped as junk is still not this crate's to erase.
+///
+/// A type byte that says "volume" with a sector count of zero describes
+/// nothing, so the probe drops it — and a commit built only from what
+/// the probe returned then zeroes its slot. The rule the writer works
+/// to is "put back what the probe did not report", which covers this
+/// without anyone having to enumerate the kinds of junk a table can
+/// hold; a rule written as "put back containers and markers" would
+/// have missed it.
+#[test]
+fn a_commit_that_changed_nothing_keeps_an_entry_the_probe_skipped() {
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0x83, 2048, 2048);
+    plant_mbr_entry(&dev, 1, 0x83, 8192, 0);
+
+    let before = mbr_table(&dev);
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(
+        set.partitions.len(),
+        1,
+        "the zero-length entry was reported"
+    );
+    set.commit(&dev).unwrap();
+
+    assert_eq!(
+        mbr_table(&dev),
+        before,
+        "a commit that changed nothing erased the zero-length entry in slot 1"
+    );
+}
+
+/// A partition added to a probed table does not get given the
+/// container's slot.
+///
+/// The slot search sees the volumes; the container is not one, so a
+/// search that is not told about it hands out slot 0 and the new
+/// partition is written over the container. This is the compounding
+/// half of the same defect: the entry is not merely dropped, its seat
+/// is handed to somebody else.
+#[test]
+fn a_partition_added_to_a_probed_table_does_not_take_the_containers_slot() {
+    let dev = MemDev::new(DISK_64M as usize);
+    // The container is in slot 0, so the first free slot a search finds
+    // without knowing about it is the container's.
+    plant_mbr_entry(&dev, 0, 0x0F, 8192, 16384);
+    plant_mbr_entry(&dev, 1, 0x83, 2048, 2048);
+
+    let before = mbr_table(&dev);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.add(
+        Some(32 * ONE_MIB),
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        None,
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let after = mbr_table(&dev);
+    assert_eq!(
+        &after[0..16],
+        &before[0..16],
+        "the added partition was written into the container's slot"
+    );
+    // And it did land somewhere: slot 2 is the first one free.
+    assert_eq!(
+        after[2 * 16 + 4],
+        0x83,
+        "the added partition was not written"
+    );
+}
+
+/// A table holding a container and three volumes is full, and `add`
+/// says so rather than letting `commit` discover it.
+///
+/// Counting only the volumes makes a fourth one look like it fits. The
+/// caller then finishes editing, calls `commit`, and is told there is
+/// no free slot — after the work, and in a place that cannot say which
+/// partition is the problem.
+#[test]
+fn a_probed_table_with_a_container_is_full_at_three_volumes() {
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0x0F, 2048, 2048);
+    plant_mbr_entry(&dev, 1, 0x83, 8192, 2048);
+    plant_mbr_entry(&dev, 2, 0x83, 12288, 2048);
+    plant_mbr_entry(&dev, 3, 0x83, 16384, 2048);
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.partitions.len(), 3);
+    match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
+        Err(Error::Invalid(m)) => assert!(
+            m.contains("full"),
+            "the fourth volume was refused for the wrong reason: {m}"
+        ),
+        other => panic!("a fourth volume beside a container gave {other:?}"),
+    }
+}
+
+/// The writer counts the preserved entries against the four slots too,
+/// and says which limit was hit.
+///
+/// `assign_slots` would also refuse this, one layer down and as "no
+/// free slot left in the table". The count is checked here so the
+/// caller is told the table is full rather than told about slots, so
+/// the message is asserted and not just the refusal.
+#[test]
+fn the_mbr_writer_counts_preserved_entries_against_the_four_slots() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let reserved = [partitions::mbr::ReservedEntry {
+        slot: 3,
+        bytes: [0u8; 16],
+    }];
+    let mut parts = Vec::new();
+    for i in 0..4u64 {
+        parts.push(Partition {
+            start: (2 + i) * ONE_MIB,
+            length: ONE_MIB,
+            kind: PartitionKind::Mbr {
+                type_byte: 0x83,
+                active: false,
+            },
+            label: None,
+            uuid: None,
+            slot: None,
+            issues: 0,
+        });
+    }
+    match partitions::mbr::write_mbr_preserving(&dev, &parts, &reserved) {
+        Err(Error::Invalid(m)) => assert!(
+            m.contains("at most 4 primary partitions"),
+            "refused, but not as a full table: {m}"
+        ),
+        other => panic!("four volumes beside a preserved entry gave {other:?}"),
+    }
+}

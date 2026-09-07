@@ -203,14 +203,38 @@ pub fn write_gpt(
 /// one would be written over the other and the table would silently
 /// lose a partition.
 pub(crate) fn assign_slots(partitions: &[Partition], num_entries: u32) -> Result<Vec<u32>> {
+    assign_slots_with_taken(partitions, num_entries, &[])
+}
+
+/// As [`assign_slots`], with `pre_taken` naming slots that are already
+/// spoken for by something that is not in `partitions`.
+///
+/// The MBR writer has such entries: the extended container and the
+/// hybrid `0xEE` marker are in the table but are not volumes, so they
+/// never appear in the partition list, and a slot search that cannot
+/// see them hands one of their slots to the next partition added.
+pub(crate) fn assign_slots_with_taken(
+    partitions: &[Partition],
+    num_entries: u32,
+    pre_taken: &[u32],
+) -> Result<Vec<u32>> {
     let mut taken = vec![false; num_entries as usize];
+    for slot in pre_taken {
+        let seat = taken.get_mut(*slot as usize).ok_or(Error::Invalid(
+            "reserved entry slot past the end of the table",
+        ))?;
+        if *seat {
+            return Err(Error::Invalid("two entries claim the same table slot"));
+        }
+        *seat = true;
+    }
     for p in partitions {
         let Some(slot) = p.slot else { continue };
         let seat = taken
             .get_mut(slot as usize)
             .ok_or(Error::Invalid("partition slot past the end of the table"))?;
         if *seat {
-            return Err(Error::Invalid("two partitions claim the same table slot"));
+            return Err(Error::Invalid("two entries claim the same table slot"));
         }
         *seat = true;
     }

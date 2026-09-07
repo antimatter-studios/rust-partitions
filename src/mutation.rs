@@ -100,6 +100,13 @@ pub struct PartitionSet {
     pub disk_size: u64,
     /// Disk GUID for the GPT header. Ignored when `table_kind == Mbr`.
     pub disk_guid: [u8; 16],
+    /// The MBR entries `probe` did not report — an extended container,
+    /// a hybrid `0xEE` marker — each with the slot it occupies.
+    ///
+    /// `commit` writes these back verbatim, and `add` counts them
+    /// against the four primary slots. Empty for a GPT set and for a
+    /// set built from scratch, which have nothing to preserve.
+    pub reserved: Vec<mbr::ReservedEntry>,
 }
 
 impl PartitionSet {
@@ -109,6 +116,16 @@ impl PartitionSet {
     pub fn from_probe(dev: &dyn BlockRead) -> Result<Self> {
         let (table_kind, partitions) = crate::probe(dev)?;
         let disk_size = dev.size_bytes();
+        // Re-read LBA 0 for the entries the probe filtered out. `probe`
+        // returns the volumes, which is right for a caller mounting
+        // from the table and wrong for one about to write it back.
+        let reserved = if table_kind == TableKind::Mbr {
+            let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
+            dev.read_at(0, &mut sector)?;
+            mbr::reserved_entries(&sector)
+        } else {
+            Vec::new()
+        };
         let disk_guid = if table_kind == TableKind::Gpt {
             // Re-read LBA 1 to pull the disk GUID out.
             let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
@@ -122,6 +139,7 @@ impl PartitionSet {
             partitions,
             disk_size,
             disk_guid,
+            reserved,
         })
     }
 
@@ -132,6 +150,7 @@ impl PartitionSet {
             partitions: Vec::new(),
             disk_size,
             disk_guid: random_uuid(),
+            reserved: Vec::new(),
         }
     }
 
@@ -142,6 +161,7 @@ impl PartitionSet {
             partitions: Vec::new(),
             disk_size,
             disk_guid: [0u8; 16],
+            reserved: Vec::new(),
         }
     }
 
@@ -161,7 +181,13 @@ impl PartitionSet {
         if length == 0 {
             return Err(Error::Invalid("zero length"));
         }
-        if self.table_kind == TableKind::Mbr && self.partitions.len() >= 4 {
+        // The preserved entries hold slots too: a table with three
+        // volumes and a container is full, and the fourth volume added
+        // to it would otherwise be refused by `commit` rather than
+        // here, after the caller has finished editing.
+        if self.table_kind == TableKind::Mbr
+            && self.partitions.len() + self.reserved.len() >= mbr::layout::ENTRY_COUNT
+        {
             return Err(Error::Invalid("MBR primary table is full (4 entries)"));
         }
         if self.table_kind == TableKind::Gpt && self.partitions.len() >= 128 {
@@ -301,7 +327,7 @@ impl PartitionSet {
                 crate::gpt_write::write_gpt(dev, &self.partitions, self.disk_guid)?;
             }
             TableKind::Mbr => {
-                mbr::write_mbr(dev, &self.partitions)?;
+                mbr::write_mbr_preserving(dev, &self.partitions, &self.reserved)?;
             }
         }
         dev.flush()?;
