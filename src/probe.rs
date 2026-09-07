@@ -52,6 +52,37 @@ pub enum PartitionKind {
 }
 
 impl Partition {
+    /// The first and last sector this partition occupies.
+    ///
+    /// The expression is `(start + length) / SECTOR_SIZE - 1`, and it
+    /// was written inline at five sites: three in the GPT writer, one in
+    /// the MBR writer, and one in `mutation`. Both operands come from a
+    /// partition table, which comes off a disk, so the addition can
+    /// leave a `u64` — a panic in a checked build and, in release where
+    /// these crates ship with `overflow-checks` off, a wrap.
+    ///
+    /// `mutation` was fixed for exactly this and the other four copies
+    /// were not, which is the argument for there being one copy. What a
+    /// wrapped end does depends on where it lands: in the overlap pass
+    /// it answers "no overlap" about a partition that does overlap, and
+    /// in the writer it goes into the entry array, so the table on disk
+    /// carries an ending LBA below its starting LBA and no reader will
+    /// take it.
+    ///
+    /// A zero-length partition has no last sector, and computing one
+    /// underflows for the same reason. Neither shape describes a range
+    /// that can be reasoned about, so both are refused rather than
+    /// guessed at.
+    pub fn sector_span(&self) -> Result<(u64, u64)> {
+        let end = self.start.checked_add(self.length).ok_or(Error::Invalid(
+            "a partition's start and length overflow a u64",
+        ))?;
+        let last = (end / crate::SECTOR_SIZE)
+            .checked_sub(1)
+            .ok_or(Error::Invalid("a partition has no last sector"))?;
+        Ok((self.start / crate::SECTOR_SIZE, last))
+    }
+
     /// True when this partition is marked bootable in the on-disk table.
     ///
     /// - MBR: the active flag is set on the entry (legacy BIOS boots from

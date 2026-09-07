@@ -49,30 +49,6 @@ pub enum PartitionTypeId {
     MbrCustom(u8),
 }
 
-/// The first and last sector a partition occupies.
-///
-/// Every caller here used to write `(p.start + p.length) / SECTOR_SIZE - 1`
-/// inline, three times over. Both operands came from the partition
-/// table, which came off the disk, so the addition can overflow: in a
-/// checked build that is a panic, and in release -- where these crates
-/// ship with `overflow-checks` off -- it wraps, and the wrapped `p_end`
-/// makes an overlap check answer "no overlap" about a partition that
-/// does overlap. The result is a new partition placed on top of an
-/// existing one.
-///
-/// A zero-length partition has no last sector, and computing one
-/// underflows for the same reason. Neither shape describes a range that
-/// can be reasoned about, so both are refused rather than guessed at.
-fn sector_span(p: &Partition) -> Result<(u64, u64)> {
-    let end = p.start.checked_add(p.length).ok_or(Error::Invalid(
-        "an existing partition's start and length overflow",
-    ))?;
-    let last = (end / SECTOR_SIZE)
-        .checked_sub(1)
-        .ok_or(Error::Invalid("an existing partition has no last sector"))?;
-    Ok((p.start / SECTOR_SIZE, last))
-}
-
 impl PartitionTypeId {
     fn to_gpt_guid(self) -> Result<[u8; 16]> {
         Ok(match self {
@@ -230,7 +206,7 @@ impl PartitionSet {
 
         // Overlap check against existing partitions.
         for p in &self.partitions {
-            let (p_start, p_end) = sector_span(p)?;
+            let (p_start, p_end) = p.sector_span()?;
             if start_lba <= p_end && end_lba >= p_start {
                 return Err(Error::Invalid("partition overlaps existing entry"));
             }
@@ -302,7 +278,7 @@ impl PartitionSet {
             if j == idx {
                 continue;
             }
-            let (p_start, p_end) = sector_span(p)?;
+            let (p_start, p_end) = p.sector_span()?;
             if start_lba <= p_end && new_end_lba >= p_start {
                 return Err(Error::Invalid("resize would overlap another partition"));
             }
@@ -371,7 +347,7 @@ impl PartitionSet {
 
         let mut cursor = align_up(first_usable, ALIGNMENT_SECTORS);
         for p in &sorted {
-            let (p_start, p_end) = sector_span(p)?;
+            let (p_start, p_end) = p.sector_span()?;
             let wanted_end = cursor.saturating_add(length_sectors).saturating_sub(1);
             if wanted_end < p_start {
                 // Gap before this partition is big enough.

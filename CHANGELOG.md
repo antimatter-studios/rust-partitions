@@ -6,6 +6,31 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The GPT writer no longer commits a table it cannot read back.** The
+  ending-LBA derivation `(start + length) / SECTOR_SIZE - 1` was written
+  inline at five sites; `mutation` had been fixed for the overflow it can
+  carry and the other four had not. In release, where these crates ship
+  with `overflow-checks` off, `write_gpt` accepted a partition whose span
+  leaves a `u64` and wrote an entry with `ending_lba` below
+  `starting_lba` — both CRCs valid, backup written, success reported, and
+  the table unparseable by this crate and by anything else that checks
+  the pair. In debug the same input panicked. The derivation now lives in
+  one checked place and the two profiles agree.
+- `validate_partition` bounds a partition's *start* against the last
+  usable LBA, not only its end. Without that the only thing keeping an
+  absurd start out of the table was the end check, which a wrapped end
+  passes trivially.
+
+### Added
+
+- `Partition::sector_span`, the one checked derivation of a partition's
+  first and last sector.
+- A `test (release)` CI job. A guard against a wrapping computation
+  passes in a debug `cargo test` for the wrong reason — the panic — while
+  the behaviour it guards against is still live in the built library.
+
 ## [0.4.1] — 2026-09-06
 
 ### Fixed

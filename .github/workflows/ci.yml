@@ -33,6 +33,27 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  # The debug profile turns integer overflow into a panic; the release
+  # profile, which is what ships, lets it wrap. A guard against a
+  # wrapping computation therefore passes in `cargo test` for the wrong
+  # reason — the panic — while the behaviour it guards against is still
+  # live in the built library. Running the suite once in release is what
+  # makes those tests mean anything.
+  test-release:
+    name: test (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone am-fs-core sibling
+        shell: bash
+        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: test --release
+        run: cargo test --locked --release --all-targets
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest

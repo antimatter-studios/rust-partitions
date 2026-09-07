@@ -180,8 +180,7 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
     let mut prev_end_lba: Option<u64> = None;
     for p in &sorted {
         validate_mbr_partition(p, total_bytes)?;
-        let start_lba = p.start / SECTOR_SIZE;
-        let end_lba = (p.start + p.length) / SECTOR_SIZE - 1;
+        let (start_lba, end_lba) = p.sector_span()?;
         if let Some(prev) = prev_end_lba {
             if start_lba <= prev {
                 return Err(Error::Invalid("partitions overlap"));
@@ -226,7 +225,12 @@ fn validate_mbr_partition(p: &Partition, total_bytes: u64) -> Result<()> {
     if !p.start.is_multiple_of(SECTOR_SIZE) || !p.length.is_multiple_of(SECTOR_SIZE) {
         return Err(Error::Invalid("partition not sector-aligned"));
     }
-    let start_lba = p.start / SECTOR_SIZE;
+    // Derived through the checked helper rather than inline: the cap
+    // below happens to reject everything that would wrap, which is a
+    // coincidence of two unrelated bounds -- the cap is about the
+    // 32-bit on-disk field, not about u64 arithmetic -- and not
+    // something the next edit should have to know.
+    let (start_lba, _) = p.sector_span()?;
     let sectors = p.length / SECTOR_SIZE;
     if start_lba > MBR_LBA_MAX || sectors > MBR_LBA_MAX {
         return Err(Error::Invalid("partition exceeds MBR 32-bit LBA range"));
@@ -235,7 +239,10 @@ fn validate_mbr_partition(p: &Partition, total_bytes: u64) -> Result<()> {
     if start_lba < 1 {
         return Err(Error::Invalid("MBR partition cannot start at LBA 0"));
     }
-    if (p.start + p.length) > total_bytes {
+    let end = p.start.checked_add(p.length).ok_or(Error::Invalid(
+        "a partition's start and length overflow a u64",
+    ))?;
+    if end > total_bytes {
         return Err(Error::Invalid("partition extends past device end"));
     }
     Ok(())

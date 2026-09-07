@@ -72,8 +72,7 @@ pub fn write_gpt(
     let mut prev_end_lba: Option<u64> = None;
     for (_, p) in &sorted {
         validate_partition(p, FIRST_USABLE_LBA, last_usable_lba)?;
-        let start_lba = p.start / SECTOR_SIZE;
-        let end_lba = (p.start + p.length) / SECTOR_SIZE - 1;
+        let (start_lba, end_lba) = p.sector_span()?;
         if let Some(prev) = prev_end_lba {
             if start_lba <= prev {
                 return Err(Error::Invalid("partitions overlap"));
@@ -94,8 +93,7 @@ pub fn write_gpt(
             _ => return Err(Error::Invalid("non-GPT partition kind in GPT write")),
         };
         let uuid = p.uuid.ok_or(Error::Invalid("GPT partition missing UUID"))?;
-        let start_lba = p.start / SECTOR_SIZE;
-        let end_lba = (p.start + p.length) / SECTOR_SIZE - 1;
+        let (start_lba, end_lba) = p.sector_span()?;
 
         array[off..off + 16].copy_from_slice(&type_guid);
         array[off + 16..off + 32].copy_from_slice(&uuid);
@@ -185,10 +183,17 @@ fn validate_partition(p: &Partition, first_usable: u64, last_usable: u64) -> Res
     if !p.start.is_multiple_of(SECTOR_SIZE) || !p.length.is_multiple_of(SECTOR_SIZE) {
         return Err(Error::Invalid("partition not sector-aligned"));
     }
-    let start_lba = p.start / SECTOR_SIZE;
-    let end_lba = (p.start + p.length) / SECTOR_SIZE - 1;
+    let (start_lba, end_lba) = p.sector_span()?;
     if start_lba < first_usable {
         return Err(Error::Invalid("partition starts before first usable LBA"));
+    }
+    // The start needs its own upper bound, not just the end's. Without
+    // it the only thing keeping an absurd `start` out of the table is
+    // the end check, and a `start` far enough out makes the end wrap to
+    // something small -- which that check then waves through. A refusal
+    // by name beats one that depends on the arithmetic not wrapping.
+    if start_lba > last_usable {
+        return Err(Error::Invalid("partition starts past last usable LBA"));
     }
     if end_lba > last_usable {
         return Err(Error::Invalid("partition ends past last usable LBA"));

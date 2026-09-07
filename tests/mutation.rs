@@ -469,3 +469,117 @@ fn a_zero_length_partition_is_refused_not_underflowed() {
         other => panic!("adding beside a zero-length partition gave {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The same arithmetic, in the place that writes it to disk
+// ---------------------------------------------------------------------------
+
+/// A partition whose `start + length` leaves a `u64`, chosen so the
+/// wrapped sum lands somewhere the surrounding checks accept.
+///
+/// `start` is the last sector of the 64-bit address space and `length`
+/// is two sectors, so the sum wraps to 512 and the derived end LBA to
+/// zero: below `last_usable`, so the "ends past last usable LBA" test
+/// passes, and below `start_lba`, which is exactly the shape no reader
+/// will accept. A sum that wrapped to something large would have been
+/// caught by that test — accidentally, and only for some inputs.
+///
+/// `Partition`'s fields are all `pub` and `PartitionSet.partitions` is a
+/// `pub Vec`, so a caller can hand these numbers straight to the writers
+/// without going through `add`, which bounds them.
+fn overflowing_gpt_partition() -> Partition {
+    Partition {
+        // 2^64 - 512: the last whole sector a u64 can address.
+        start: u64::MAX - 511,
+        length: 1024,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: Some("overflowing".into()),
+        uuid: Some([9u8; 16]),
+    }
+}
+
+/// `write_gpt` derived a partition's ending LBA with `(start + length)
+/// / SECTOR_SIZE - 1`, unchecked, at three separate sites.
+///
+/// `mutation.rs` had already fixed this expression once, with a comment
+/// saying why: in release, where these crates ship with
+/// `overflow-checks` off, it wraps. The copies in the code that writes
+/// the table to disk were not updated, and `validate_partition`'s
+/// `end_lba > last_usable` test passes trivially once the value has
+/// wrapped to something small.
+///
+/// So in release the crate wrote a table it then refused to read —
+/// `ending_lba` below `starting_lba`, both CRCs valid, backup written,
+/// and success reported. In debug it panicked. This test fails in both
+/// configurations before the fix and passes in both after it, which is
+/// the point: the two builds must not disagree.
+#[test]
+fn write_gpt_refuses_a_span_that_leaves_a_u64_rather_than_wrapping_it() {
+    let dev = MemDev::new(DISK_64M as usize);
+    match partitions::gpt_write::write_gpt(&dev, &[overflowing_gpt_partition()], [1u8; 16]) {
+        Err(Error::Invalid(_)) => {}
+        other => panic!(
+            "write_gpt gave {other:?} for a partition whose span leaves a u64 — \
+             in release that is a committed table with ending_lba < starting_lba"
+        ),
+    }
+
+    // And nothing reached the disk. A refusal that had already written
+    // the header would leave the caller with a half-committed table.
+    let mut lba1 = [0u8; 8];
+    dev.read_at(512, &mut lba1).unwrap();
+    assert_eq!(
+        &lba1, b"\0\0\0\0\0\0\0\0",
+        "a GPT header was written anyway"
+    );
+}
+
+/// The overlap pass runs before the entry array is built, and derives
+/// the same end. A wrapped end there answers "no overlap" about a
+/// partition that does overlap.
+#[test]
+fn write_gpt_refuses_an_overflowing_span_beside_a_real_partition() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let sound = Partition {
+        start: ONE_MIB,
+        length: 4 * ONE_MIB,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: None,
+        uuid: Some([3u8; 16]),
+    };
+    match partitions::gpt_write::write_gpt(&dev, &[sound, overflowing_gpt_partition()], [1u8; 16]) {
+        Err(Error::Invalid(_)) => {}
+        other => panic!("write_gpt gave {other:?} for an overflowing span"),
+    }
+}
+
+/// `write_mbr` carries the same expression. Its `MBR_LBA_MAX` cap
+/// happens to reject the inputs that would wrap before the expression
+/// runs, so this is a guard against that accident being relied on
+/// rather than a live defect — the cap is about the 32-bit on-disk
+/// field, not about `u64` arithmetic, and the two are only incidentally
+/// aligned.
+#[test]
+fn write_mbr_refuses_a_span_that_leaves_a_u64() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let p = Partition {
+        start: u64::MAX - 511,
+        length: 1024,
+        kind: PartitionKind::Mbr {
+            type_byte: 0x83,
+            active: false,
+        },
+        label: None,
+        uuid: None,
+    };
+    match partitions::mbr::write_mbr(&dev, &[p]) {
+        Err(Error::Invalid(_)) => {}
+        other => panic!("write_mbr gave {other:?} for a partition whose span leaves a u64"),
+    }
+}
