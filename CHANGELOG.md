@@ -8,6 +8,14 @@ never does.
 
 ### Fixed
 
+- **An MBR entry that is not a volume is no longer reported as one.**
+  `mbr::parse` emitted every non-empty entry, including the two kinds
+  that describe no filesystem: the `0x05` / `0x0F` extended-partition
+  containers, whose contents are a linked list of EBRs, and the `0xEE`
+  GPT-protective marker, which in a hybrid MBR comes back as a whole-disk
+  partition overlapping every real one. Sniffing a container read an EBR
+  and called it an unknown filesystem; slicing one handed a driver the
+  chain.
 - **The GPT writer no longer commits a table it cannot read back.** The
   ending-LBA derivation `(start + length) / SECTOR_SIZE - 1` was written
   inline at five sites; `mutation` had been fixed for the overflow it can
@@ -25,6 +33,10 @@ never does.
 
 ### Added
 
+- `mbr::EntryRole` and `mbr::entry_role`, naming what an MBR entry
+  describes, and `mbr::parse_all_entries` for a caller that wants the
+  table as it is on disk — a repair or inspection tool — where leaving an
+  entry out would be its own kind of wrong answer.
 - `Partition::sector_span`, the one checked derivation of a partition's
   first and last sector.
 - A `test (release)` CI job. A guard against a wrapping computation
