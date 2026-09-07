@@ -575,3 +575,73 @@ fn mbr_sector(dev: &Bytes) -> [u8; 512] {
     dev.read_at(0, &mut sector).unwrap();
     sector
 }
+
+// ---------------------------------------------------------------------------
+// Sniffing a partition that runs off the end of its device
+// ---------------------------------------------------------------------------
+
+/// A partition running past the end of the device it was found on is
+/// ordinary rather than hostile — a `dd` of the first part of a disk, or
+/// a table left stale after the volume was shrunk, produces one. The C
+/// ABI's `slice_on_device` says exactly that and clamps the length so a
+/// caller reads what is there.
+///
+/// `sniff` did not clamp. It asked the parent device for a full window
+/// at the partition's declared start, and `read_at` is all-or-nothing,
+/// so the same partition that `partitions_open_slice` opens happily came
+/// back from `partitions_sniff` as a short read. A consumer's UI then has
+/// to explain why a partition it can open has no detectable filesystem.
+///
+/// The shape is not rare: a small ESP or BIOS-boot partition at the tail
+/// of a `dd`-ed image is shorter than the 34 KiB window on its own.
+#[test]
+fn a_partition_running_off_the_end_is_still_sniffed() {
+    const DEVICE: usize = 1024 * 1024;
+    const START: u64 = DEVICE as u64 - 8 * 1024;
+    let dev = Bytes::new(DEVICE);
+
+    // A recognisable superblock at the partition's start.
+    dev.write(START as usize + 3, b"NTFS    ");
+    dev.write(START as usize + 510, &[0x55, 0xAA]);
+
+    let part = Partition {
+        start: START,
+        // Four megabytes claimed, eight kilobytes present.
+        length: 4 * 1024 * 1024,
+        kind: PartitionKind::Mbr {
+            type_byte: 0x07,
+            active: false,
+        },
+        label: None,
+        uuid: None,
+        slot: Some(0),
+    };
+
+    assert_eq!(
+        sniff::sniff(&dev, &part).expect("a truncated partition must still be classified"),
+        FsKind::Ntfs
+    );
+}
+
+/// A partition whose start is past the end of the device has nothing to
+/// read, and stays an error. Clamping the window must not turn "there is
+/// no such region" into "an unrecognised filesystem".
+#[test]
+fn a_partition_beginning_past_the_end_is_still_an_error() {
+    let dev = Bytes::new(1024 * 1024);
+    let part = Partition {
+        start: 4 * 1024 * 1024,
+        length: 1024 * 1024,
+        kind: PartitionKind::Mbr {
+            type_byte: 0x83,
+            active: false,
+        },
+        label: None,
+        uuid: None,
+        slot: Some(0),
+    };
+    assert!(
+        sniff::sniff(&dev, &part).is_err(),
+        "a partition outside the device must not be classified"
+    );
+}

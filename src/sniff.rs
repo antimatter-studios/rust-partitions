@@ -48,10 +48,27 @@ pub enum ExtVersion {
 
 /// Sniff the filesystem at the start of `partition`. The partition's `length`
 /// determines how much we're allowed to read.
+///
+/// The window is also clamped to the device, for the same reason
+/// `capi::slice_on_device` clamps: a partition running past the end of
+/// the device it was found on is ordinary rather than hostile — a `dd`
+/// of the first part of a disk, or a table left stale after the volume
+/// was shrunk, produces one — and `read_at` is all-or-nothing, so a
+/// window sized from the *claim* fails outright on exactly the image the
+/// clamp exists for. Without it, `partitions_sniff` returned a short
+/// read for a partition `partitions_open_slice` opened happily, and the
+/// consumer had to explain why something it can read has no filesystem.
+///
+/// A partition beginning past the end of the device has nothing to read
+/// and stays an error: clamping must not turn "there is no such region"
+/// into "an unrecognised filesystem". Everything `classify` looks at is
+/// already length-guarded, so a short window simply rules out the probes
+/// it cannot reach.
 pub fn sniff(dev: &dyn BlockRead, partition: &Partition) -> Result<FsKind> {
     // Largest window we need: 0x8001 + 5 bytes for ISO9660. Round up.
-    let want = std::cmp::min(0x8800u64, partition.length) as usize;
-    let mut buf = vec![0u8; want];
+    let want = std::cmp::min(0x8800u64, partition.length);
+    let available = dev.size_bytes().saturating_sub(partition.start);
+    let mut buf = vec![0u8; std::cmp::min(want, available) as usize];
     dev.read_at(partition.start, &mut buf)?;
     Ok(classify(&buf))
 }

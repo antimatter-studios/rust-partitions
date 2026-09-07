@@ -646,6 +646,53 @@ mod tests {
         }
     }
 
+    /// `partitions_open_slice` clamps a partition to the device it was
+    /// found on; `partitions_sniff` did not, so the same index gave a
+    /// working device from one call and a short read from the other. A
+    /// consumer's UI then has to explain why a partition it can open has
+    /// no detectable filesystem.
+    #[test]
+    fn sniff_and_open_slice_agree_about_a_partition_that_runs_off_the_end() {
+        const DEVICE: usize = 1024 * 1024;
+        const START: usize = DEVICE - 8 * 1024;
+        let mut bytes = vec![0u8; DEVICE];
+        // One MBR entry starting 8 KiB from the end and claiming 4 MiB.
+        let entry = 446;
+        bytes[entry + 4] = 0x07;
+        bytes[entry + 8..entry + 12].copy_from_slice(&((START / 512) as u32).to_le_bytes());
+        bytes[entry + 12..entry + 16].copy_from_slice(&(4u32 * 1024 * 1024 / 512).to_le_bytes());
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        // A recognisable superblock where the partition starts.
+        bytes[START + 3..START + 11].copy_from_slice(b"NTFS    ");
+        bytes[START + 510] = 0x55;
+        bytes[START + 511] = 0xAA;
+
+        let dev = FsCoreDevice::into_handle(Arc::new(Bytes(Mutex::new(bytes))));
+        let mut list_ptr: *mut PartitionList = ptr::null_mut();
+        unsafe {
+            assert_eq!(partitions_probe(dev, &mut list_ptr), FsCoreErrorCode::Ok);
+
+            let slice = partitions_open_slice(list_ptr, 0);
+            assert!(!slice.is_null(), "the slice must open");
+            assert_eq!(
+                fs_core::ffi::fs_core_device_size_bytes(slice),
+                8 * 1024,
+                "the slice is clamped to what is on the device"
+            );
+            fs_core_device_close(slice);
+
+            assert_eq!(
+                partitions_sniff(list_ptr, 0),
+                FsKindCode::Ntfs as i32,
+                "sniff must see the same bytes the slice hands over"
+            );
+
+            partitions_list_free(list_ptr);
+            fs_core_device_close(dev);
+        }
+    }
+
     /// A whole-device entry is not in any table, so it has no slot.
     #[test]
     fn a_whole_device_entry_reports_no_slot() {
