@@ -1084,7 +1084,7 @@ fn the_mbr_writer_counts_preserved_entries_against_the_four_slots() {
 // The table's shape survives a round trip
 // ---------------------------------------------------------------------------
 
-use partitions::gpt_write::{write_gpt_with_geometry, GptGeometry};
+use partitions::gpt_write::{self, write_gpt_with_geometry, GptGeometry};
 
 /// The header fields that describe the table's shape.
 fn gpt_shape(dev: &MemDev) -> (u32, u32, u64, u64, u64) {
@@ -1275,4 +1275,47 @@ fn build_gpt_shaped_declared(dev: &MemDev, geometry: GptGeometry, start_lba: u64
     let (want_first, want_last) = geometry.declared_usable.expect("a declared range");
     assert_eq!(first, want_first, "fixture first usable LBA");
     assert_eq!(last, want_last, "fixture last usable LBA");
+}
+
+// ---------------------------------------------------------------------------
+// The smallest disk the writer can describe
+// ---------------------------------------------------------------------------
+
+/// `write_gpt` refuses a disk one sector too small, rather than writing
+/// a header whose usable range runs backwards.
+///
+/// The old guard was `total_bytes < (34 + 32 + 1) * 512`, so a 67-sector
+/// disk passed it — and then `last_usable_lba` came out as 33, one below
+/// the first usable LBA. Both CRCs were correct, so the table was a
+/// valid GPT describing an impossible disk, and `validate_partition`
+/// would afterwards refuse every partition against that range with a
+/// message blaming the partition.
+///
+/// Two sizes, because a bound is worth two tests: 67 is the last size
+/// that must be refused and 68 the first that must be accepted. A guard
+/// corrected in the wrong direction passes one and fails the other.
+///
+/// A 34 KiB disk is not a common thing to partition. What makes this
+/// worth a test is that the failure was silent and the output
+/// well-formed.
+#[test]
+fn the_writer_refuses_a_disk_one_sector_too_small_for_its_own_table() {
+    let sector = 512usize;
+    let dev = MemDev::new(67 * sector);
+    match gpt_write::write_gpt(&dev, &[], [0x33u8; 16]) {
+        Err(Error::DeviceTooSmall) => {}
+        other => panic!("a 67-sector disk gave {other:?}"),
+    }
+
+    let dev = MemDev::new(68 * sector);
+    gpt_write::write_gpt(&dev, &[], [0x33u8; 16])
+        .expect("68 sectors is the smallest disk a canonical table fits on");
+
+    let (_, _, _, first, last) = gpt_shape(&dev);
+    assert_eq!(first, 34, "the first usable LBA moved");
+    assert_eq!(last, 34, "a 68-sector disk has exactly one usable LBA");
+    assert!(
+        first <= last,
+        "the table describes a usable range that runs backwards: {first}..{last}"
+    );
 }
