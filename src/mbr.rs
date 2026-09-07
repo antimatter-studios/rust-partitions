@@ -170,6 +170,11 @@ pub fn entry_role(type_byte: u8) -> EntryRole {
 /// used to come back from a hybrid MBR — one `0xEE` beside real entries,
 /// which every bootable dual-boot USB carries — as a whole-disk
 /// partition overlapping every real one.
+/// [`reserved_entries`] is this filter's complement: between them they
+/// account for every non-empty entry in the table, and a caller writing
+/// a probed table back needs both halves. The two must stay in step, so
+/// `every_non_empty_entry_is_either_a_volume_or_reserved` asserts the
+/// property rather than leaving it to whoever edits one of them.
 pub fn parse(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
     let mut all = parse_all_entries(lba0)?;
     all.retain(|p| match p.kind {
@@ -222,6 +227,56 @@ pub fn parse_all_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Pa
     Ok(out)
 }
 
+/// A primary entry that [`parse`] does not return, held as the sixteen
+/// bytes it was read as.
+///
+/// The volumes are what a caller edits; the rest of the table is not
+/// theirs to lose. An extended container is a chain of partition tables
+/// and a `0xEE` is the marker saying the real table is the GPT — neither
+/// is a volume, and both have to go back into the slot they came from
+/// when a set that came from a probe is written out again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedEntry {
+    /// Which of the four primary slots this entry occupies.
+    pub slot: u32,
+    /// The entry's sixteen bytes, verbatim.
+    pub bytes: [u8; layout::ENTRY_SIZE],
+}
+
+/// Every non-empty entry [`parse`] leaves out, with the slot it sits in.
+///
+/// That is the containers and markers [`entry_role`] names, and also an
+/// entry whose sector count is zero, which `parse` skips. The rule is
+/// "what the probe did not report", stated once here so a caller
+/// round-tripping a probe puts back exactly what the probe did not hand
+/// it — a narrower rule would silently drop whatever it did not think of.
+pub fn reserved_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Vec<ReservedEntry> {
+    let mut out = Vec::new();
+    for i in 0..layout::ENTRY_COUNT {
+        let off = layout::entry_at(i);
+        let type_byte = lba0[off + layout::TYPE_BYTE];
+        if type_byte == types::EMPTY {
+            continue;
+        }
+        let sectors = u32::from_le_bytes([
+            lba0[off + layout::SECTOR_COUNT],
+            lba0[off + layout::SECTOR_COUNT + 1],
+            lba0[off + layout::SECTOR_COUNT + 2],
+            lba0[off + layout::SECTOR_COUNT + 3],
+        ]);
+        if entry_role(type_byte) == EntryRole::Volume && sectors != 0 {
+            continue;
+        }
+        let mut bytes = [0u8; layout::ENTRY_SIZE];
+        bytes.copy_from_slice(&lba0[off..off + layout::ENTRY_SIZE]);
+        out.push(ReservedEntry {
+            slot: i as u32,
+            bytes,
+        });
+    }
+    out
+}
+
 /// Write a fresh MBR sector with up to four primary entries. The bootloader
 /// region (offset 0..446) is zeroed — there is no provision for preserving
 /// existing boot code. A future `with_boot_code` variant can carry caller-
@@ -235,10 +290,36 @@ pub fn parse_all_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Pa
 ///   32-bit LBA range MBR uses.
 /// - Partitions must not overlap.
 pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> {
+    write_mbr_preserving(dev, partitions, &[])
+}
+
+/// As [`write_mbr`], and puts `reserved` back in the slots they came
+/// from, byte for byte.
+///
+/// A caller that got its partitions from `probe` was handed the volumes
+/// only, so writing that list alone erases everything else the table
+/// held: the extended container's slot comes back as type `0x00` with
+/// the EBR chain still on disk and nothing pointing at it, and a hybrid
+/// MBR loses the `0xEE` that tells firmware the real table is the GPT.
+/// Both happen on a round trip that changed nothing and both report
+/// success. [`reserved_entries`] produces this list from the sector the
+/// probe read.
+///
+/// The reserved entries take no part in the overlap check: a `0xEE`
+/// marker spans the whole disk by design and overlaps every real
+/// partition, so checking it against them would refuse every hybrid MBR
+/// there is. They are bytes to be preserved rather than a layout to be
+/// validated — they were on the disk already, and this writer is not
+/// the one that put them there.
+pub fn write_mbr_preserving(
+    dev: &dyn BlockDevice,
+    partitions: &[Partition],
+    reserved: &[ReservedEntry],
+) -> Result<()> {
     if !dev.is_writable() {
         return Err(Error::Block(fs_core::Error::ReadOnly));
     }
-    if partitions.len() > 4 {
+    if partitions.len() + reserved.len() > layout::ENTRY_COUNT {
         return Err(Error::Invalid("MBR supports at most 4 primary partitions"));
     }
     let total_bytes = dev.size_bytes();
@@ -261,8 +342,18 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
         prev_end_lba = Some(end_lba);
     }
 
-    let slots = crate::gpt_write::assign_slots(partitions, layout::ENTRY_COUNT as u32)?;
+    let taken: Vec<u32> = reserved.iter().map(|r| r.slot).collect();
+    let slots =
+        crate::gpt_write::assign_slots_with_taken(partitions, layout::ENTRY_COUNT as u32, &taken)?;
     let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
+    // The preserved entries go down first, so that a slot collision --
+    // which `assign_slots_with_taken` refuses, so this is belt and
+    // braces -- would end with the caller's edit on disk rather than
+    // stale bytes over it.
+    for r in reserved {
+        let off = layout::entry_at(r.slot as usize);
+        sector[off..off + layout::ENTRY_SIZE].copy_from_slice(&r.bytes);
+    }
     for (p, slot) in partitions.iter().zip(&slots) {
         let off = layout::entry_at(*slot as usize);
         let (type_byte, active) = match p.kind {
@@ -319,4 +410,82 @@ fn validate_mbr_partition(p: &Partition, total_bytes: u64) -> Result<()> {
         return Err(Error::Invalid("partition extends past device end"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod complement_tests {
+    use super::*;
+
+    /// A table with a volume, a container, a marker, and a zero-length
+    /// entry -- one of each thing a slot can hold.
+    fn mixed_table() -> [u8; crate::SECTOR_SIZE_USIZE] {
+        let mut lba0 = [0u8; crate::SECTOR_SIZE_USIZE];
+        let mut put = |slot: usize, type_byte: u8, start: u32, sectors: u32| {
+            let off = layout::entry_at(slot);
+            lba0[off + layout::TYPE_BYTE] = type_byte;
+            lba0[off + layout::START_LBA..off + layout::START_LBA + 4]
+                .copy_from_slice(&start.to_le_bytes());
+            lba0[off + layout::SECTOR_COUNT..off + layout::SECTOR_COUNT + 4]
+                .copy_from_slice(&sectors.to_le_bytes());
+        };
+        put(0, types::GPT_PROTECTIVE, 1, 4096);
+        put(1, 0x83, 2048, 2048);
+        put(2, types::EXTENDED_LBA, 8192, 8192);
+        put(3, 0x83, 20480, 0);
+        lba0[510] = 0x55;
+        lba0[511] = 0xAA;
+        lba0
+    }
+
+    /// The two halves account for the whole table, with nothing counted
+    /// twice and nothing dropped.
+    ///
+    /// The property is what a round trip depends on: `commit` writes the
+    /// volumes plus the reserved entries, so an entry that falls into
+    /// neither half is erased and an entry in both is written twice.
+    #[test]
+    fn every_non_empty_entry_is_either_a_volume_or_reserved() {
+        let lba0 = mixed_table();
+        let volumes = parse(&lba0).unwrap();
+        let reserved = reserved_entries(&lba0);
+
+        let non_empty = (0..layout::ENTRY_COUNT)
+            .filter(|i| lba0[layout::entry_at(*i) + layout::TYPE_BYTE] != types::EMPTY)
+            .count();
+        assert_eq!(non_empty, 4, "the fixture stopped filling all four slots");
+        assert_eq!(
+            volumes.len() + reserved.len(),
+            non_empty,
+            "an entry is in both halves or in neither"
+        );
+
+        let volume_slots: Vec<u32> = volumes.iter().filter_map(|p| p.slot).collect();
+        assert_eq!(volume_slots, vec![1]);
+        let reserved_slots: Vec<u32> = reserved.iter().map(|r| r.slot).collect();
+        assert_eq!(reserved_slots, vec![0, 2, 3]);
+    }
+
+    /// A reserved entry is the bytes that were there, not a
+    /// reconstruction of them.
+    ///
+    /// The container's CHS fields and status byte are meaningless to
+    /// this crate and meaningful to whatever wrote them, so they are
+    /// carried rather than rebuilt from the fields it does understand.
+    #[test]
+    fn a_reserved_entry_holds_the_sixteen_bytes_as_they_were() {
+        let mut lba0 = mixed_table();
+        let off = layout::entry_at(2);
+        // Status and CHS: fields this crate never writes.
+        lba0[off] = STATUS_ACTIVE;
+        lba0[off + 1] = 0xAA;
+        lba0[off + 2] = 0xBB;
+        lba0[off + 3] = 0xCC;
+
+        let reserved = reserved_entries(&lba0);
+        let container = reserved
+            .iter()
+            .find(|r| r.slot == 2)
+            .expect("the container");
+        assert_eq!(&container.bytes[..], &lba0[off..off + layout::ENTRY_SIZE]);
+    }
 }
