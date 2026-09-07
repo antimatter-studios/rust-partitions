@@ -441,8 +441,18 @@ fn parse_utf16_label(bytes: &[u8]) -> Option<String> {
         units.push(u);
     }
     if units.is_empty() {
-        None
-    } else {
-        String::from_utf16(&units).ok()
+        return None;
     }
+    // Lossy, deliberately.
+    //
+    // A label is display text, and the only thing that can be wrong with
+    // it here is an unpaired surrogate — which is what a writer that cut
+    // the field at 36 code units without regard for surrogate pairs
+    // leaves behind, including this crate's own writer until recently.
+    // Decoding strictly and dropping the result on failure answered "no
+    // label" for a name that is almost entirely readable, and said
+    // nothing about why. One replacement character in the last position
+    // tells a user more than an empty name does, and nothing computes on
+    // a partition label.
+    Some(String::from_utf16_lossy(&units))
 }
