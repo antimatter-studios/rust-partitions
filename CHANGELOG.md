@@ -18,7 +18,16 @@ never does.
   at a character boundary, and the reader shows what is readable of a
   name some other writer cut mid-pair rather than throwing all of it
   away.
-
+- **Sniffing a partition clamps to the device the way slicing does.**
+  `capi::slice_on_device` clamps a partition that runs past the end of
+  the device it was found on, because a truncated image or a stale table
+  produces one and refusing takes away the one thing the user wants.
+  `sniff` sized its read window from the partition's declared length and
+  `read_at` is all-or-nothing, so `partitions_sniff` returned a short
+  read for exactly the image the clamp exists for, on the same index
+  where `partitions_open_slice` returned a working device. A partition
+  beginning *past* the end of the device still has nothing to read and
+  stays an error.
 - **A commit no longer renumbers the disk.** A partition's slot in the
   on-disk table is its identity to everything above this crate — the `3`
   in `/dev/sda3`, the `s3` in `disk4s3` — and it was dropped on the way
