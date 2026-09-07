@@ -437,6 +437,7 @@ fn a_partition_whose_start_and_length_overflow_is_refused_not_wrapped() {
         },
         label: Some("overflowing".into()),
         uuid: Some([7u8; 16]),
+        slot: None,
     });
 
     match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
@@ -462,6 +463,7 @@ fn a_zero_length_partition_is_refused_not_underflowed() {
         },
         label: None,
         uuid: Some([8u8; 16]),
+        slot: None,
     });
 
     match set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None) {
@@ -498,6 +500,7 @@ fn overflowing_gpt_partition() -> Partition {
         },
         label: Some("overflowing".into()),
         uuid: Some([9u8; 16]),
+        slot: None,
     }
 }
 
@@ -552,6 +555,7 @@ fn write_gpt_refuses_an_overflowing_span_beside_a_real_partition() {
         },
         label: None,
         uuid: Some([3u8; 16]),
+        slot: None,
     };
     match partitions::gpt_write::write_gpt(&dev, &[sound, overflowing_gpt_partition()], [1u8; 16]) {
         Err(Error::Invalid(_)) => {}
@@ -577,9 +581,143 @@ fn write_mbr_refuses_a_span_that_leaves_a_u64() {
         },
         label: None,
         uuid: None,
+        slot: None,
     };
     match partitions::mbr::write_mbr(&dev, &[p]) {
         Err(Error::Invalid(_)) => {}
         other => panic!("write_mbr gave {other:?} for a partition whose span leaves a u64"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A partition's slot in the table is its identity
+// ---------------------------------------------------------------------------
+
+/// A partition's slot in the on-disk table is its identity to the rest
+/// of the system — the `3` in `/dev/sda3`, the `s3` in `disk4s3`. A GPT
+/// with a hole in it is routine: it is what a deletion leaves, and it is
+/// the normal state of a macOS disk, where slot numbering is not
+/// compacted.
+///
+/// `write_gpt` wrote each partition into the slot matching its position
+/// in the `Vec`, so probe → commit compacted a sparse table into slots
+/// 0..n. Nothing about the surviving partitions changed except their
+/// numbers, and every fstab entry, boot-loader config and bookmark that
+/// named one by number then pointed at a different volume — with the
+/// operation reporting success.
+#[test]
+fn committing_an_unchanged_table_leaves_every_partition_in_its_slot() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let a = gpt_partition(4 * ONE_MIB, 4 * ONE_MIB, "a", 1, Some(0));
+    let c = gpt_partition(16 * ONE_MIB, 4 * ONE_MIB, "c", 3, Some(2));
+    partitions::gpt_write::write_gpt(&dev, &[a, c], [5u8; 16]).unwrap();
+
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(
+        parts.iter().map(|p| p.slot).collect::<Vec<_>>(),
+        vec![Some(0), Some(2)],
+        "probe must report the slot each entry came from"
+    );
+
+    // Round-trip it unchanged.
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, after) = probe(&dev).unwrap();
+    assert_eq!(
+        after.iter().map(|p| p.slot).collect::<Vec<_>>(),
+        vec![Some(0), Some(2)],
+        "a commit that changed nothing renumbered the disk"
+    );
+    let labels: Vec<_> = after.iter().filter_map(|p| p.label.clone()).collect();
+    assert_eq!(labels, vec!["a", "c"]);
+}
+
+/// Removing a partition must not move the ones after it. `Vec::remove`
+/// shifts, and with the slot derived from vector position that shift
+/// reached the disk: delete partition 2 of four and 3 and 4 became 2
+/// and 3.
+#[test]
+fn removing_a_partition_does_not_renumber_the_ones_after_it() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let parts = vec![
+        gpt_partition(4 * ONE_MIB, 4 * ONE_MIB, "a", 1, Some(0)),
+        gpt_partition(12 * ONE_MIB, 4 * ONE_MIB, "b", 2, Some(1)),
+        gpt_partition(20 * ONE_MIB, 4 * ONE_MIB, "c", 3, Some(2)),
+    ];
+    partitions::gpt_write::write_gpt(&dev, &parts, [5u8; 16]).unwrap();
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.remove(PartitionRef::Index(1)).unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, after) = probe(&dev).unwrap();
+    let by_label: Vec<(String, Option<u32>)> = after
+        .iter()
+        .map(|p| (p.label.clone().unwrap_or_default(), p.slot))
+        .collect();
+    assert_eq!(
+        by_label,
+        vec![("a".to_string(), Some(0)), ("c".to_string(), Some(2))],
+        "deleting the middle partition moved the last one's number"
+    );
+}
+
+/// A partition that has never been on a disk has no slot, and gets the
+/// lowest free one — not the one matching its position in the vector,
+/// which is what would collide with an existing entry's number.
+#[test]
+fn a_new_partition_takes_the_lowest_free_slot() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let occupied = gpt_partition(20 * ONE_MIB, 4 * ONE_MIB, "kept", 1, Some(2));
+    partitions::gpt_write::write_gpt(&dev, &[occupied], [5u8; 16]).unwrap();
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("new".into()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, after) = probe(&dev).unwrap();
+    let mut by_label: Vec<(String, Option<u32>)> = after
+        .iter()
+        .map(|p| (p.label.clone().unwrap_or_default(), p.slot))
+        .collect();
+    by_label.sort();
+    assert_eq!(
+        by_label,
+        vec![("kept".to_string(), Some(2)), ("new".to_string(), Some(0))]
+    );
+}
+
+/// Two partitions cannot claim the same slot: one of them would be
+/// written over the other and the table would silently lose a
+/// partition.
+#[test]
+fn two_partitions_claiming_one_slot_are_refused() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let a = gpt_partition(4 * ONE_MIB, 4 * ONE_MIB, "a", 1, Some(1));
+    let b = gpt_partition(12 * ONE_MIB, 4 * ONE_MIB, "b", 2, Some(1));
+    match partitions::gpt_write::write_gpt(&dev, &[a, b], [5u8; 16]) {
+        Err(Error::Invalid(_)) => {}
+        other => panic!("two partitions in slot 1 gave {other:?}"),
+    }
+}
+
+fn gpt_partition(start: u64, length: u64, label: &str, uuid: u8, slot: Option<u32>) -> Partition {
+    Partition {
+        start,
+        length,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: Some(label.into()),
+        uuid: Some([uuid; 16]),
+        slot,
     }
 }

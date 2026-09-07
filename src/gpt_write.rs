@@ -82,9 +82,10 @@ pub fn write_gpt(
     }
 
     // --- Build the entry array (16 KiB, all zeros + populated slots). ---
+    let slots = assign_slots(partitions, NUM_ENTRIES)?;
     let mut array = vec![0u8; ENTRY_ARRAY_BYTES as usize];
-    for (idx, p) in partitions.iter().enumerate() {
-        let off = idx * ENTRY_SIZE as usize;
+    for (p, slot) in partitions.iter().zip(&slots) {
+        let off = (*slot as usize) * ENTRY_SIZE as usize;
         let (type_guid, attributes) = match p.kind {
             PartitionKind::Gpt {
                 type_guid,
@@ -171,6 +172,54 @@ pub fn write_gpt(
     dev.write_at(last_lba * SECTOR_SIZE, &backup)?;
 
     Ok(())
+}
+
+/// Which table slot each partition is written into.
+///
+/// A partition's slot is its identity to everything above this crate —
+/// the `3` in `/dev/sda3` — so a partition that came off a disk goes
+/// back into the slot it came from. Writing each one into the slot
+/// matching its position in the `Vec`, which is what this used to do,
+/// compacts a table with a hole in it and renumbers every partition
+/// after the hole: a probe, an unrelated edit and a commit were enough
+/// to break every fstab entry and boot-loader config that named one by
+/// number, with the operation reporting success.
+///
+/// A partition with no slot has never been in a table, so it takes the
+/// lowest free one. Two partitions claiming the same slot is refused:
+/// one would be written over the other and the table would silently
+/// lose a partition.
+pub(crate) fn assign_slots(partitions: &[Partition], num_entries: u32) -> Result<Vec<u32>> {
+    let mut taken = vec![false; num_entries as usize];
+    for p in partitions {
+        let Some(slot) = p.slot else { continue };
+        let seat = taken
+            .get_mut(slot as usize)
+            .ok_or(Error::Invalid("partition slot past the end of the table"))?;
+        if *seat {
+            return Err(Error::Invalid("two partitions claim the same table slot"));
+        }
+        *seat = true;
+    }
+
+    let mut next_free = 0usize;
+    let mut out = Vec::with_capacity(partitions.len());
+    for p in partitions {
+        match p.slot {
+            Some(slot) => out.push(slot),
+            None => {
+                while next_free < taken.len() && taken[next_free] {
+                    next_free += 1;
+                }
+                if next_free == taken.len() {
+                    return Err(Error::Invalid("no free slot left in the table"));
+                }
+                taken[next_free] = true;
+                out.push(next_free as u32);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn validate_partition(p: &Partition, first_usable: u64, last_usable: u64) -> Result<()> {

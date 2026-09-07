@@ -135,6 +135,18 @@ pub struct PartitionInfo {
     /// GPT 64-bit attributes field (entry offset +48). 0 for MBR /
     /// Whole partitions. See [`crate::gpt::attr`] for named bits.
     pub attributes: u64,
+    /// The slot this entry occupies in the on-disk table, or `-1` when
+    /// it has none (a whole-device entry).
+    ///
+    /// The slot is the partition's number to everything above this
+    /// crate — the `3` in `/dev/sda3`, the `s3` in `disk4s3`. A table
+    /// with a hole in it is routine, so the index a caller passed to
+    /// [`partitions_get`] is not the partition's number and never was.
+    /// See [`crate::Partition::slot`].
+    pub slot: i32,
+    /// 4 bytes of explicit padding so the struct's size is a multiple of
+    /// its 8-byte alignment on every target.
+    pub _pad3: [u8; 4],
 }
 
 // The C declaration of the struct above lives in `include/partitions.h` and
@@ -148,7 +160,7 @@ pub struct PartitionInfo {
 // compile on a 32-bit target. `tests/c_abi.rs` has no such limit — it
 // compares Rust against a C compiler for whatever target is being built.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<PartitionInfo>() == 80);
+const _: () = assert!(size_of::<PartitionInfo>() == 88);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(align_of::<PartitionInfo>() == 8);
 
@@ -335,6 +347,8 @@ pub unsafe extern "C" fn partitions_sniff_device(
             kind: PartitionKind::Whole,
             label: None,
             uuid: None,
+            // A whole-device probe has no table, so no slot.
+            slot: None,
         };
         match sniff::sniff(&*parent, &synthetic) {
             Ok(kind) => FsKindCode::from(kind) as i32,
@@ -468,6 +482,8 @@ fn build_info(p: &Partition, table: TableKindCode) -> PartitionInfo {
         bootable: if p.is_bootable() { 1 } else { 0 },
         _pad2: [0u8; 7],
         attributes,
+        slot: p.slot.map_or(-1, |s| s as i32),
+        _pad3: [0u8; 4],
     }
 }
 
@@ -593,6 +609,55 @@ mod tests {
         bytes[511] = 0xAA;
         let dev = Bytes(Mutex::new(bytes));
         FsCoreDevice::into_handle(Arc::new(dev))
+    }
+
+    /// A device whose MBR uses slot 2 and leaves 0, 1 and 3 empty.
+    /// Nothing in the index a caller passes to `partitions_get` says
+    /// which slot the entry came from, which is why the struct carries
+    /// it.
+    fn make_mbr_device_in_slot_two() -> *mut FsCoreDevice {
+        let mut bytes = vec![0u8; 4 * 1024 * 1024];
+        let entry = 446 + 2 * 16;
+        bytes[entry + 4] = 0x83;
+        bytes[entry + 8..entry + 12].copy_from_slice(&2048u32.to_le_bytes());
+        bytes[entry + 12..entry + 16].copy_from_slice(&2048u32.to_le_bytes());
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        FsCoreDevice::into_handle(Arc::new(Bytes(Mutex::new(bytes))))
+    }
+
+    /// The number a C caller shows a user is the table slot, not the
+    /// index it looped over. With three empty slots in front of it, the
+    /// only entry on this disk is at index 0 and in slot 2.
+    #[test]
+    fn partition_info_carries_the_table_slot_not_the_list_index() {
+        let dev = make_mbr_device_in_slot_two();
+        let mut list_ptr: *mut PartitionList = ptr::null_mut();
+        unsafe {
+            assert_eq!(partitions_probe(dev, &mut list_ptr), FsCoreErrorCode::Ok);
+            assert_eq!(partitions_count(list_ptr), 1);
+
+            let mut info = std::mem::zeroed::<PartitionInfo>();
+            assert_eq!(partitions_get(list_ptr, 0, &mut info), FsCoreErrorCode::Ok);
+            assert_eq!(info.slot, 2, "the entry's own slot, not its list index");
+
+            partitions_list_free(list_ptr);
+            fs_core_device_close(dev);
+        }
+    }
+
+    /// A whole-device entry is not in any table, so it has no slot.
+    #[test]
+    fn a_whole_device_entry_reports_no_slot() {
+        let p = Partition {
+            start: 0,
+            length: 4096,
+            kind: PartitionKind::Whole,
+            label: None,
+            uuid: None,
+            slot: None,
+        };
+        assert_eq!(build_info(&p, TableKindCode::Gpt).slot, -1);
     }
 
     #[test]

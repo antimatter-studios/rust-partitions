@@ -39,6 +39,10 @@ It does **not** mount anything, decode files, or write — it's a probe.
 - [x] Mutation API: `add` / `remove` / `resize` over an in-memory partition set, with 1 MiB alignment and a first-fit free-space finder (`PartitionSet`)
 - [x] `commit(&dev)` semantics — writes happen on commit, not on mutation
 - [x] Round-trip tests: probe → mutate → commit → re-probe matches intent (`tests/mutation.rs`)
+- [x] Slot identity: a partition keeps the table slot it came from across a
+      probe → mutate → commit round trip, so an unrelated edit does not
+      renumber the disk. A partition with no slot yet takes the lowest free
+      one (`Partition::slot`, `PartitionInfo.slot`)
 - [ ] C ABI for the writer — the existing `partitions_*` handle stays read-only; a writable handle is a follow-up
 - [ ] Optional `with_boot_code` variant of the MBR / protective-MBR writer for legacy BIOS boot
 
