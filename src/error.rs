@@ -42,6 +42,14 @@ pub enum Error {
     /// Mutation API tried to write a partition table that does not fit the
     /// device, or the device is too small for the chosen table type.
     DeviceTooSmall,
+    /// The disk counts its LBAs in units this crate does not read.
+    ///
+    /// Constructed only for a 4Kn disk — 4096-byte *logical* sectors —
+    /// whose GPT was found where a 4Kn GPT lives. This crate reads and
+    /// writes partition tables in 512-byte units throughout (see
+    /// [`crate::SECTOR_SIZE`]), so such a disk is refused by name rather
+    /// than read at the wrong scale.
+    UnsupportedSectorSize(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -57,6 +65,7 @@ impl fmt::Display for Error {
             Error::GptBackupMismatch(s) => write!(f, "GPT backup mismatch: {s}"),
             Error::Invalid(s) => write!(f, "invalid argument: {s}"),
             Error::DeviceTooSmall => write!(f, "device too small for the requested table"),
+            Error::UnsupportedSectorSize(s) => write!(f, "unsupported sector size: {s}"),
         }
     }
 }

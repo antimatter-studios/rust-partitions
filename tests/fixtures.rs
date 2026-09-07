@@ -1110,3 +1110,126 @@ fn an_entry_starting_past_the_disk_is_reported() {
     );
     assert_eq!(parts[0].issues, entry_issue::PAST_LAST_USABLE);
 }
+
+// ---------------------------------------------------------------------------
+// 4Kn disks
+//
+// A disk with 4096-byte *logical* sectors counts its GPT LBAs in
+// 4096-byte units, so its header is at byte 4096 and byte 512 is still
+// inside LBA 0 — the tail of the protective MBR, all zeros. The
+// signature test therefore finds nothing, while LBA 0 still carries a
+// protective MBR, because the MBR structure lives in the first 512
+// bytes of the block whatever the block size.
+// ---------------------------------------------------------------------------
+
+/// Lay down a GPT in 4096-byte LBAs. `my_lba` and the header CRC are
+/// parameters so the detection's individual conditions can be pinned.
+fn build_gpt_4kn(dev: &Bytes, my_lba: u64, repair_crc: bool) {
+    const BS: u64 = 4096;
+    let total_lbas = dev.size_bytes() / BS;
+
+    dev.write(446 + 4, &[0xEE]);
+    dev.write_u32_le(446 + 8, 1);
+    dev.write_u32_le(446 + 12, (total_lbas - 1) as u32);
+    dev.write(510, &[0x55, 0xAA]);
+
+    let num_entries: u32 = 128;
+    let entry_size: u32 = 128;
+    let entry_lba = 2u64;
+    let mut array = vec![0u8; (num_entries as u64 * entry_size as u64) as usize];
+    array[0..16].copy_from_slice(&type_guids::LINUX_FILESYSTEM);
+    array[16..32].copy_from_slice(&[7u8; 16]);
+    array[32..40].copy_from_slice(&256u64.to_le_bytes());
+    array[40..48].copy_from_slice(&511u64.to_le_bytes());
+    dev.write((entry_lba * BS) as usize, &array);
+
+    let mut header = vec![0u8; BS as usize];
+    header[0..8].copy_from_slice(b"EFI PART");
+    header[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    header[12..16].copy_from_slice(&92u32.to_le_bytes());
+    header[24..32].copy_from_slice(&my_lba.to_le_bytes());
+    header[32..40].copy_from_slice(&(total_lbas - 1).to_le_bytes());
+    header[40..48].copy_from_slice(&34u64.to_le_bytes());
+    header[48..56].copy_from_slice(&(total_lbas - 34).to_le_bytes());
+    header[56..72].copy_from_slice(&[0xCAu8; 16]);
+    header[72..80].copy_from_slice(&entry_lba.to_le_bytes());
+    header[80..84].copy_from_slice(&num_entries.to_le_bytes());
+    header[84..88].copy_from_slice(&entry_size.to_le_bytes());
+    header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
+    if repair_crc {
+        let hc = crc32fast::hash(&header[..92]);
+        header[16..20].copy_from_slice(&hc.to_le_bytes());
+    }
+    dev.write(BS as usize, &header);
+}
+
+/// A healthy 4Kn GPT disk is refused by name, not reported as corrupt.
+///
+/// Before this it came back as
+/// `GptCorrupt("protective MBR present but no GPT signature")` — a
+/// perfectly sound disk described as a broken table, which sends a user
+/// looking for damage that is not there.
+#[test]
+fn a_4kn_gpt_disk_is_refused_by_its_sector_size() {
+    let dev = Bytes::new(64 * 1024 * 1024);
+    build_gpt_4kn(&dev, 1, true);
+    match probe(&dev) {
+        Err(Error::UnsupportedSectorSize(msg)) => {
+            assert!(
+                msg.contains("4096"),
+                "the refusal must name the size: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedSectorSize, got {other:?}"),
+    }
+}
+
+/// The detection needs a header whose CRC checks out.
+///
+/// Byte 4096 on a 512-byte-sector disk is inside the entry array, where
+/// an entry's type GUID could in principle read as `EFI PART`. Random
+/// bytes will not also carry a valid header CRC, so the CRC is what
+/// makes a false positive impossible — and a false positive here would
+/// refuse a healthy 512-byte disk, which is worse than the bug.
+#[test]
+fn a_bad_header_crc_at_byte_4096_is_not_taken_for_a_4kn_disk() {
+    let dev = Bytes::new(64 * 1024 * 1024);
+    build_gpt_4kn(&dev, 1, false); // CRC left wrong
+    assert!(
+        !matches!(probe(&dev), Err(Error::UnsupportedSectorSize(_))),
+        "a header that fails its own CRC must not be read as a 4Kn disk"
+    );
+}
+
+/// And a header that does not claim to be at LBA 1.
+///
+/// A header at byte 4096 says `my_lba == 1` only when LBA 1 *is* byte
+/// 4096. Anything else is not a 4Kn primary header, whatever else is
+/// true of it.
+#[test]
+fn a_header_at_byte_4096_claiming_another_lba_is_not_a_4kn_disk() {
+    let dev = Bytes::new(64 * 1024 * 1024);
+    build_gpt_4kn(&dev, 8, true);
+    assert!(
+        !matches!(probe(&dev), Err(Error::UnsupportedSectorSize(_))),
+        "my_lba must be 1 for a header at byte 4096 to mean 4Kn"
+    );
+}
+
+/// The positive control: an ordinary 512-byte-sector GPT disk is
+/// untouched by the new check.
+///
+/// Its entry array covers byte 4096, so this is the case a careless
+/// detection would break — and it is the commonest disk there is.
+#[test]
+fn an_ordinary_512_byte_gpt_disk_is_not_taken_for_a_4kn_disk() {
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[(type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "data")],
+    );
+    let (kind, parts) = probe(&dev).expect("a 512-byte GPT disk must still probe");
+    assert_eq!(kind, TableKind::Gpt);
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].start, 2048 * 512);
+}
