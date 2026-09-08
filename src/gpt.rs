@@ -500,6 +500,53 @@ pub fn parse(dev: &dyn BlockRead, lba1: &[u8; crate::SECTOR_SIZE_USIZE]) -> Resu
     Ok(parts)
 }
 
+/// The bytes past the standard 128 of each entry, keyed by the
+/// partition's own UUID.
+///
+/// The specification fixes the first 128 bytes of an entry and lets a
+/// table declare a larger `partition_entry_size`; the remainder is
+/// vendor or future-format payload that nothing in this crate can
+/// reconstruct. `parse` drops it, and the writer builds a fresh array
+/// of zeros — so a probe-then-commit that changed nothing zeroed the
+/// tail of every entry on such a disk.
+///
+/// **Keyed by UUID and not by slot.** `assign_slots` re-uses a seat a
+/// removed partition vacated, so a tail carried by position would be
+/// handed to whichever partition next occupied that slot: a stranger's
+/// vendor bytes attached to somebody else's partition, and a removed
+/// partition's payload surviving its removal. A partition's UUID is
+/// what identifies it across a rewrite, so the tail travels with the
+/// partition wherever its slot goes.
+///
+/// Empty for a table whose `partition_entry_size` is the standard 128,
+/// where there is no tail to carry.
+pub type EntryTails = std::collections::BTreeMap<[u8; 16], Vec<u8>>;
+
+/// Read the entry array and return each entry's tail bytes.
+///
+/// Returns an empty map when the table's entries are the standard 128
+/// bytes, so a caller need not ask whether there is anything to keep.
+pub fn entry_tails(dev: &dyn BlockRead, header: &Header) -> Result<EntryTails> {
+    let mut out = EntryTails::new();
+    let entry_size = header.partition_entry_size as usize;
+    if entry_size <= ENTRY_STANDARD_BYTES {
+        return Ok(out);
+    }
+    let (parts, array) = parse_entry_array(dev, header)?;
+    for p in &parts {
+        let Some(uuid) = p.uuid else { continue };
+        let Some(slot) = p.slot else { continue };
+        let off = (slot as usize) * entry_size;
+        let tail = &array[off + ENTRY_STANDARD_BYTES..off + entry_size];
+        out.insert(uuid, tail.to_vec());
+    }
+    Ok(out)
+}
+
+/// Bytes of an entry the specification defines. Everything past this is
+/// the table's own payload.
+pub const ENTRY_STANDARD_BYTES: usize = 128;
+
 /// Outcome of validating the backup GPT header against the primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupStatus {

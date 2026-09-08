@@ -257,6 +257,44 @@ pub fn write_gpt_with_geometry(
     disk_guid: [u8; 16],
     geometry: GptGeometry,
 ) -> Result<()> {
+    write_gpt_preserving_tails(
+        dev,
+        partitions,
+        disk_guid,
+        geometry,
+        &gpt::EntryTails::new(),
+    )
+}
+
+/// As [`write_gpt_with_geometry`], carrying each entry's tail bytes.
+///
+/// The specification fixes the first 128 bytes of an entry and lets a
+/// table declare a larger `partition_entry_size`. This writer builds a
+/// fresh array of zeros and fills in those 128 bytes, so on a disk
+/// whose entries are larger, a probe-then-commit that changed nothing
+/// zeroed the rest of every entry — vendor or future-format payload
+/// that nothing in this crate can reconstruct.
+///
+/// Refusing such a disk instead would be worse than the loss it
+/// prevents: this writer exists to put a table back in the shape it was
+/// found in, and a disk that cannot be committed is a disk that cannot
+/// be edited at all.
+///
+/// `tails` is keyed by the partition's own UUID rather than by slot,
+/// and that is the whole of the care needed here. [`assign_slots`]
+/// re-uses a seat a removed partition vacated, so a tail carried by
+/// position would be handed to whichever partition next sat there — a
+/// stranger's vendor bytes on somebody else's partition, and a removed
+/// partition's payload outliving it. A partition with no entry in the
+/// map — one just created — gets zeros, which is right for a table
+/// being made rather than rewritten.
+pub fn write_gpt_preserving_tails(
+    dev: &dyn BlockDevice,
+    partitions: &[Partition],
+    disk_guid: [u8; 16],
+    geometry: GptGeometry,
+    tails: &gpt::EntryTails,
+) -> Result<()> {
     if !dev.is_writable() {
         return Err(Error::Block(fs_core::Error::ReadOnly));
     }
@@ -300,6 +338,19 @@ pub fn write_gpt_with_geometry(
         };
         let uuid = p.uuid.ok_or(Error::Invalid("GPT partition missing UUID"))?;
         let (start_lba, end_lba) = p.sector_span()?;
+
+        // The partition's own tail, before the standard bytes are laid
+        // over the front of it. Truncated or zero-padded to this
+        // table's entry size, because the geometry being written is not
+        // required to be the one the tail came off.
+        if geometry.entry_size as usize > gpt::ENTRY_STANDARD_BYTES {
+            let room = geometry.entry_size as usize - gpt::ENTRY_STANDARD_BYTES;
+            if let Some(tail) = tails.get(&uuid) {
+                let take = tail.len().min(room);
+                let at = off + gpt::ENTRY_STANDARD_BYTES;
+                array[at..at + take].copy_from_slice(&tail[..take]);
+            }
+        }
 
         array[off..off + 16].copy_from_slice(&type_guid);
         array[off + 16..off + 32].copy_from_slice(&uuid);
