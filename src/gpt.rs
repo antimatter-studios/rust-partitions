@@ -262,15 +262,22 @@ pub fn mark_overlaps(spans: &[(u64, u64)]) -> Vec<bool> {
     let mut flags = vec![false; spans.len()];
     let mut order: Vec<usize> = (0..spans.len()).collect();
     order.sort_by_key(|&i| spans[i].0);
-    for w in order.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        if spans[b].0 <= spans[a].1 {
-            flags[a] = true;
-            flags[b] = true;
-        }
-    }
-    // A sorted-neighbour pass misses a short entry entirely swallowed by
-    // a long one two places back, so carry the highest end seen so far.
+    // One pass, carrying the highest end seen so far.
+    //
+    // A sorted-neighbour comparison is not enough on its own — a short
+    // entry entirely swallowed by a long one two places back is
+    // invisible to it — and this pass subsumes it, so there used to be
+    // two where one does the work.
+    //
+    // Why it subsumes it: take a neighbouring pair `(a, b)` in sorted
+    // order with `spans[b].0 <= spans[a].1`. By the time `b` is
+    // reached, `highest_end` covers every entry before it, so
+    // `end >= spans[a].1 >= spans[b].0` and `b` is flagged. Its partner
+    // is flagged too, though it may be some earlier `j` rather than
+    // `a`: if `j` is not `a` then `j` precedes `a` with
+    // `spans[j].1 >= spans[a].1`, so `spans[a].0 <= spans[j].1` and `a`
+    // was already flagged when `a` itself came round. No input reaches
+    // a verdict here that the neighbour pass would have reached first.
     let mut highest_end: Option<(usize, u64)> = None;
     for &i in &order {
         if let Some((j, end)) = highest_end {
@@ -593,6 +600,74 @@ fn parse_utf16_label(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod rule_tests {
+    /// `mark_overlaps` agrees with the definition of overlapping, on
+    /// every span set of three inside a small coordinate space.
+    ///
+    /// The function used to make two passes, and the second subsumed
+    /// the first — the argument for that is in the comment on the
+    /// function. An argument is worth having and is not evidence, and
+    /// "the suite stayed green" is evidence about the tests rather than
+    /// about the function.
+    ///
+    /// So this compares the pass that remains against the definition
+    /// itself: `i` overlaps something iff some other `j` shares a byte
+    /// with it. Ten spans over four coordinates, taken three at a time,
+    /// is a thousand cases and covers the shapes the passes disagreed
+    /// about — touching at a boundary, nesting, and one entry swallowed
+    /// by another two places back in sorted order.
+    ///
+    /// It also outlives the deletion: it is what a future edit to the
+    /// remaining pass is measured against.
+    #[test]
+    fn overlap_marking_agrees_with_the_definition_on_every_small_case() {
+        let spans: Vec<(u64, u64)> = (0..4u64)
+            .flat_map(|s| (s..4u64).map(move |e| (s, e)))
+            .collect();
+        assert_eq!(spans.len(), 10, "the coordinate space changed");
+
+        let mut checked = 0usize;
+        let mut with_an_overlap = 0usize;
+        for &a in &spans {
+            for &b in &spans {
+                for &c in &spans {
+                    let set = [a, b, c];
+                    let got = mark_overlaps(&set);
+                    let want: Vec<bool> = (0..set.len())
+                        .map(|i| {
+                            (0..set.len())
+                                .any(|j| j != i && set[i].0 <= set[j].1 && set[j].0 <= set[i].1)
+                        })
+                        .collect();
+                    assert_eq!(got, want, "spans {set:?}");
+                    checked += 1;
+                    if want.iter().any(|&f| f) {
+                        with_an_overlap += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 1000);
+        assert!(
+            with_an_overlap > 0 && with_an_overlap < checked,
+            "the case space is degenerate: {with_an_overlap} of {checked} overlap"
+        );
+    }
+
+    /// The case the deleted pass could not see, kept as a case with a
+    /// name rather than only as one of a thousand.
+    ///
+    /// A short entry entirely swallowed by a long one two places back
+    /// is invisible to a sorted-neighbour comparison, which is why the
+    /// second pass existed. It is the first pass that went.
+    #[test]
+    fn an_entry_swallowed_by_one_two_places_back_is_marked() {
+        // Sorted by start: (0, 100), (10, 20), (30, 40).
+        // (30, 40) neighbours (10, 20), which it does not touch, and
+        // sits inside (0, 100), which it does.
+        let flags = mark_overlaps(&[(0, 100), (10, 20), (30, 40)]);
+        assert_eq!(flags, vec![true, true, true]);
+    }
+
     use super::{entry_issue, mark_overlaps, range_issues};
 
     /// The usable-range rule, at both edges.
