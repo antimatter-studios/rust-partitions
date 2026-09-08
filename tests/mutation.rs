@@ -1533,3 +1533,197 @@ fn a_refused_geometry_leaves_the_first_two_sectors_alone() {
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].label.as_deref(), Some("root"));
 }
+
+/// A commit that changed nothing keeps the bytes past 128 of every
+/// entry.
+///
+/// The writer builds a fresh array of zeros and fills in the 128 bytes
+/// the specification defines, so on a table whose entries are larger,
+/// an unchanged probe-then-commit erased the rest of every one — vendor
+/// or future-format payload that nothing in this crate can
+/// reconstruct.
+///
+/// Refusing such a disk instead, which is the other remedy on offer,
+/// would be worse than the loss: this writer exists to put a table back
+/// in the shape it was found in, and a disk that cannot be committed is
+/// one that cannot be edited at all.
+#[test]
+fn a_commit_that_changed_nothing_keeps_each_entrys_tail() {
+    let dev = MemDev::new(DISK_64M as usize);
+    wide_entry_table(&dev, 2);
+    plant_entry_tail(&dev, 0, b"VENDOR-ZERO");
+    plant_entry_tail(&dev, 1, b"VENDOR-ONE");
+
+    let before = gpt_entry_array(&dev);
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.gpt_entry_tails.len(), 2, "the tails were not carried");
+    set.commit(&dev).unwrap();
+
+    let after = gpt_entry_array(&dev);
+    assert_eq!(
+        &after[128..139],
+        b"VENDOR-ZERO",
+        "entry 0's tail was zeroed by a commit that changed nothing"
+    );
+    assert_eq!(&after[256 + 128..256 + 138], b"VENDOR-ONE");
+    assert_eq!(after, before, "the array changed somewhere else as well");
+}
+
+/// A table with standard 128-byte entries carries no tails and is
+/// unaffected.
+///
+/// The control: every other GPT test here uses this shape, so if
+/// carrying tails changed anything about it the whole file would move.
+/// Stated once, deliberately, because "the rest of the suite still
+/// passes" is an argument nobody can see.
+#[test]
+fn a_standard_table_has_no_tails_to_carry() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    set.commit(&dev).unwrap();
+
+    let reloaded = PartitionSet::from_probe(&dev).unwrap();
+    assert!(
+        reloaded.gpt_entry_tails.is_empty(),
+        "a 128-byte table produced tails out of nowhere"
+    );
+    reloaded.commit(&dev).unwrap();
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts.len(), 1);
+}
+
+/// A tail follows its partition into whatever slot the partition ends
+/// up in — and does not follow the slot.
+///
+/// `assign_slots` re-uses a seat a removed partition vacated. A tail
+/// carried by position would then be handed to whichever partition next
+/// sat there: a stranger's vendor bytes attached to somebody else's
+/// partition, and a removed partition's payload outliving its removal.
+///
+/// Here the partition in slot 0 is removed and a new one is added,
+/// which takes the vacated seat. The new partition must get zeros, and
+/// the surviving partition must keep its own bytes.
+#[test]
+fn a_tail_follows_its_partition_and_not_the_slot_it_vacated() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let uuids = wide_entry_table(&dev, 2);
+    plant_entry_tail(&dev, 0, b"REMOVED-PARTITIONS-BYTES");
+    plant_entry_tail(&dev, 1, b"SURVIVOR");
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let removed = set
+        .partitions
+        .iter()
+        .position(|p| p.uuid == Some(uuids[0]))
+        .expect("the partition to remove");
+    set.remove(PartitionRef::Index(removed)).unwrap();
+    let added = set
+        .add(None, 2 * ONE_MIB, PartitionTypeId::LinuxSwap, None)
+        .unwrap();
+    assert_eq!(
+        set.partitions[added].slot, None,
+        "the new partition already has a slot, so this test would not exercise reuse"
+    );
+    set.commit(&dev).unwrap();
+
+    let array = gpt_entry_array(&dev);
+    let (_, parts) = probe(&dev).unwrap();
+    let survivor = parts
+        .iter()
+        .find(|p| p.uuid == Some(uuids[1]))
+        .expect("the surviving partition");
+    let survivor_slot = survivor.slot.unwrap() as usize;
+    assert_eq!(
+        &array[survivor_slot * 256 + 128..survivor_slot * 256 + 136],
+        b"SURVIVOR",
+        "the survivor lost its tail, or was given somebody else's"
+    );
+
+    let new = parts
+        .iter()
+        .find(|p| p.uuid != Some(uuids[1]))
+        .expect("the new partition");
+    let new_slot = new.slot.unwrap() as usize;
+    assert_eq!(
+        &array[new_slot * 256 + 128..new_slot * 256 + 152],
+        &[0u8; 24],
+        "a newly created partition inherited the tail of the one whose slot it took"
+    );
+    assert_eq!(
+        new_slot, 0,
+        "the vacated seat was not reused, so nothing was proved"
+    );
+}
+
+/// Read the primary entry array off a device.
+fn gpt_entry_array(dev: &MemDev) -> Vec<u8> {
+    let mut header = [0u8; 512];
+    dev.read_at(512, &mut header).unwrap();
+    let array_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let mut array = vec![0u8; count * size];
+    dev.read_at(array_lba * 512, &mut array).unwrap();
+    array
+}
+
+/// Write `bytes` into entry `slot`'s tail and repair both CRCs, so the
+/// table still parses.
+///
+/// The repair matters: a table failing its entry-array CRC is refused
+/// before anything reaches the writer, so a test that skipped it would
+/// be measuring the CRC check.
+fn plant_entry_tail(dev: &MemDev, slot: usize, bytes: &[u8]) {
+    let mut header = [0u8; 512];
+    dev.read_at(512, &mut header).unwrap();
+    let array_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    assert!(
+        size > 128,
+        "this fixture needs entries larger than 128 bytes"
+    );
+
+    let mut array = vec![0u8; count * size];
+    dev.read_at(array_lba * 512, &mut array).unwrap();
+    let at = slot * size + 128;
+    array[at..at + bytes.len()].copy_from_slice(bytes);
+    dev.write_at(array_lba * 512, &array).unwrap();
+
+    header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
+    header[16..20].fill(0);
+    let crc = crc32fast::hash(&header[..header_size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write_at(512, &header).unwrap();
+}
+
+/// A 256-byte-entry table with `count` partitions on it.
+fn wide_entry_table(dev: &MemDev, count: usize) -> Vec<[u8; 16]> {
+    let geometry = GptGeometry {
+        entry_size: 256,
+        ..GptGeometry::canonical()
+    };
+    let mut parts = Vec::new();
+    let mut uuids = Vec::new();
+    for i in 0..count {
+        let uuid = [0x40u8 + i as u8; 16];
+        uuids.push(uuid);
+        parts.push(Partition {
+            start: (4 + 8 * i as u64) * ONE_MIB,
+            length: 4 * ONE_MIB,
+            kind: PartitionKind::Gpt {
+                type_guid: type_guids::LINUX_FILESYSTEM,
+                attributes: 0,
+            },
+            label: Some(format!("p{i}")),
+            uuid: Some(uuid),
+            slot: Some(i as u32),
+            issues: 0,
+        });
+    }
+    write_gpt_with_geometry(dev, &parts, [0x11u8; 16], geometry).expect("a 256-byte table");
+    uuids
+}

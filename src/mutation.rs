@@ -98,6 +98,15 @@ pub struct PartitionSet {
     pub disk_size: u64,
     /// Disk GUID for the GPT header. Ignored when `table_kind == Mbr`.
     pub disk_guid: [u8; 16],
+    /// Each GPT entry's bytes past the standard 128, keyed by the
+    /// partition's own UUID.
+    ///
+    /// Empty for the usual 128-byte table, where there is no tail, and
+    /// for a set built from scratch. See [`gpt::EntryTails`] for why the
+    /// key is the UUID and not the slot: a tail carried by position
+    /// would be handed to whichever partition next occupied a vacated
+    /// seat.
+    pub gpt_entry_tails: gpt::EntryTails,
     /// The shape of the GPT this set came off, or the canonical shape
     /// for one being created. Ignored when `table_kind == Mbr`.
     ///
@@ -132,7 +141,7 @@ impl PartitionSet {
         } else {
             Vec::new()
         };
-        let (disk_guid, gpt_geometry) = if table_kind == TableKind::Gpt {
+        let (disk_guid, gpt_geometry, gpt_entry_tails) = if table_kind == TableKind::Gpt {
             // Re-read LBA 1 for the disk GUID and the table's shape.
             // The header states both, and taking only the GUID was what
             // let a commit reshape the table.
@@ -142,9 +151,14 @@ impl PartitionSet {
             (
                 header.disk_guid,
                 crate::gpt_write::GptGeometry::from_header(&header),
+                gpt::entry_tails(dev, &header)?,
             )
         } else {
-            ([0u8; 16], crate::gpt_write::GptGeometry::canonical())
+            (
+                [0u8; 16],
+                crate::gpt_write::GptGeometry::canonical(),
+                gpt::EntryTails::new(),
+            )
         };
         Ok(PartitionSet {
             table_kind,
@@ -152,6 +166,7 @@ impl PartitionSet {
             disk_size,
             disk_guid,
             gpt_geometry,
+            gpt_entry_tails,
             reserved,
         })
     }
@@ -164,6 +179,7 @@ impl PartitionSet {
             disk_size,
             disk_guid: random_uuid(),
             gpt_geometry: crate::gpt_write::GptGeometry::canonical(),
+            gpt_entry_tails: gpt::EntryTails::new(),
             reserved: Vec::new(),
         }
     }
@@ -176,6 +192,7 @@ impl PartitionSet {
             disk_size,
             disk_guid: [0u8; 16],
             gpt_geometry: crate::gpt_write::GptGeometry::canonical(),
+            gpt_entry_tails: gpt::EntryTails::new(),
             reserved: Vec::new(),
         }
     }
@@ -341,11 +358,12 @@ impl PartitionSet {
     pub fn commit(&self, dev: &dyn BlockDevice) -> Result<()> {
         match self.table_kind {
             TableKind::Gpt => {
-                crate::gpt_write::write_gpt_with_geometry(
+                crate::gpt_write::write_gpt_preserving_tails(
                     dev,
                     &self.partitions,
                     self.disk_guid,
                     self.gpt_geometry,
+                    &self.gpt_entry_tails,
                 )?;
             }
             TableKind::Mbr => {
