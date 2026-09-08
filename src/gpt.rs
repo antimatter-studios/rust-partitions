@@ -505,6 +505,9 @@ pub fn parse(dev: &dyn BlockRead, lba1: &[u8; crate::SECTOR_SIZE_USIZE]) -> Resu
 pub enum BackupStatus {
     /// Backup header parsed, CRC-validated, and reports an identical
     /// partition list to the primary (after sorting by `starting_lba`).
+    ///
+    /// Identical in every comparable field: range, UUID, type, slot and
+    /// label.
     Ok,
     /// Backup header is missing, unreadable, or fails its own CRC. The reason
     /// string is short and stable. Many real-world disks have stale or zero
@@ -538,10 +541,16 @@ pub fn parse_backup(dev: &dyn BlockRead) -> Result<Vec<Partition>> {
 }
 
 /// Validate the backup against a list of primary partitions. Returns
-/// [`BackupStatus::Ok`] when every primary entry has a matching backup entry
-/// (same UUID, type GUID, and byte range), and [`BackupStatus::Mismatch`]
-/// otherwise. A read or CRC failure becomes a `Mismatch` rather than an
+/// [`BackupStatus::Ok`] when every primary entry has a matching backup
+/// entry — same byte range, UUID, type GUID, table slot and label — and
+/// [`BackupStatus::Mismatch`] otherwise, naming which of those five
+/// diverged. A read or CRC failure becomes a `Mismatch` rather than an
 /// error, because a stale backup is the most common reason to see one.
+///
+/// Every comparable field of a `Partition` is compared. Slot and label
+/// were skipped, so a backup that renumbered or renamed a partition was
+/// called identical — and this is the one function whose whole job is
+/// to answer whether it is.
 pub fn validate_backup(dev: &dyn BlockRead, primary: &[Partition]) -> BackupStatus {
     let backup = match parse_backup(dev) {
         Ok(b) => b,
@@ -567,6 +576,25 @@ pub fn validate_backup(dev: &dyn BlockRead, primary: &[Partition]) -> BackupStat
         }
         if pa.kind != pb.kind {
             return BackupStatus::Mismatch("partition type differs");
+        }
+        // The slot is a partition's identity to everything above this
+        // crate — the `3` in `/dev/sda3` — which is why both parsers
+        // take it from the entry's array index rather than from its
+        // position in the list. A backup that files the same partition
+        // in a different slot renumbers the disk the moment firmware or
+        // a recovery tool falls back to it, and every fstab entry and
+        // boot-loader config naming a partition by number is then
+        // wrong. Comparing everything about a partition except which
+        // one it is was the one thing this function could not afford to
+        // skip.
+        if pa.slot != pb.slot {
+            return BackupStatus::Mismatch("partition slot differs");
+        }
+        // A backup that names a partition something else is a
+        // difference a user would want to hear about before it is the
+        // copy in use.
+        if pa.label != pb.label {
+            return BackupStatus::Mismatch("partition label differs");
         }
     }
     BackupStatus::Ok

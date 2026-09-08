@@ -1319,3 +1319,155 @@ fn the_writer_refuses_a_disk_one_sector_too_small_for_its_own_table() {
         "the table describes a usable range that runs backwards: {first}..{last}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What "identical" has to mean for a backup
+// ---------------------------------------------------------------------------
+
+/// Rewrite the backup entry array through `edit`, then repair the
+/// entry-array CRC and the backup header's own CRC so the table stays
+/// structurally valid.
+///
+/// The repair is the point. A backup that fails its CRC is already
+/// reported as a mismatch, so a test that skipped it would be measuring
+/// the CRC check rather than the comparison.
+fn edit_backup_entries(dev: &MemDev, edit: impl FnOnce(&mut [u8])) {
+    let total = dev.size_bytes();
+    let last_lba = total / 512 - 1;
+    let header_off = last_lba * 512;
+
+    let mut header = [0u8; 512];
+    dev.read_at(header_off, &mut header).unwrap();
+    let array_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+    let mut array = vec![0u8; count * size];
+    dev.read_at(array_lba * 512, &mut array).unwrap();
+    edit(&mut array);
+    dev.write_at(array_lba * 512, &array).unwrap();
+
+    header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
+    header[16..20].fill(0);
+    let crc = crc32fast::hash(&header[..header_size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write_at(header_off, &header).unwrap();
+}
+
+/// A backup that files the same partition in a different slot is not
+/// identical to the primary.
+///
+/// `slot` is a partition's identity to everything above this crate —
+/// the `3` in `/dev/sda3` — which is why both parsers take it from the
+/// entry's array index rather than from its position in the list. A
+/// backup that disagrees about it renumbers the disk the moment
+/// firmware or a recovery tool falls back to it, and every fstab entry
+/// and boot-loader config naming a partition by number is then wrong.
+///
+/// Everything else about the partition is untouched and both CRCs are
+/// repaired, so the only thing this can be detecting is the slot.
+#[test]
+fn a_backup_that_moves_a_partition_to_another_slot_is_a_mismatch() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("root".into()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, primary) = probe(&dev).unwrap();
+    assert_eq!(primary[0].slot, Some(0), "the fixture's slot moved");
+    assert_eq!(gpt::validate_backup(&dev, &primary), BackupStatus::Ok);
+
+    edit_backup_entries(&dev, |array| {
+        let (first, rest) = array.split_at_mut(128);
+        let seventh = &mut rest[6 * 128..7 * 128];
+        seventh.copy_from_slice(first);
+        first.fill(0);
+    });
+
+    match gpt::validate_backup(&dev, &primary) {
+        BackupStatus::Mismatch(m) => assert_eq!(
+            m, "partition slot differs",
+            "reported a mismatch, but not the one that is there"
+        ),
+        BackupStatus::Ok => {
+            panic!("a backup that renumbers the disk was called identical to the primary")
+        }
+    }
+}
+
+/// A backup that names a partition something else is not identical
+/// either.
+#[test]
+fn a_backup_that_renames_a_partition_is_a_mismatch() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("root".into()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, primary) = probe(&dev).unwrap();
+    assert_eq!(primary[0].label.as_deref(), Some("root"));
+
+    edit_backup_entries(&dev, |array| {
+        // The name field is 72 bytes of UTF-16LE at offset 56.
+        let name = &mut array[56..128];
+        name.fill(0);
+        for (i, u) in "IMPOSTOR".encode_utf16().enumerate() {
+            name[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+        }
+    });
+
+    match gpt::validate_backup(&dev, &primary) {
+        BackupStatus::Mismatch(m) => assert_eq!(
+            m, "partition label differs",
+            "reported a mismatch, but not the one that is there"
+        ),
+        BackupStatus::Ok => panic!("a backup that renames a partition was called identical"),
+    }
+}
+
+/// A backup that agrees in all five fields is still `Ok`.
+///
+/// The acceptance control for the two above: comparing more fields is
+/// only an improvement if a genuinely identical backup still passes,
+/// and a comparison that reported a mismatch for everything would
+/// satisfy both refusals while making the function useless.
+#[test]
+fn a_backup_that_agrees_in_every_field_is_still_ok() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        4 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("root".into()),
+    )
+    .unwrap();
+    set.add(
+        None,
+        2 * ONE_MIB,
+        PartitionTypeId::LinuxSwap,
+        Some("swap".into()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+
+    let (_, primary) = probe(&dev).unwrap();
+    assert_eq!(primary.len(), 2);
+    // Rewriting the array with no change still repairs the CRCs, so
+    // this also says the harness itself does not disturb the table.
+    edit_backup_entries(&dev, |_| {});
+    assert_eq!(gpt::validate_backup(&dev, &primary), BackupStatus::Ok);
+}
