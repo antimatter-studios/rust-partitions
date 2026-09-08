@@ -29,6 +29,13 @@ use fs_core::BlockDevice;
 use crate::gpt;
 use crate::gpt_layout::{ENTRY_SIZE, HEADER_SIZE, NUM_ENTRIES};
 
+/// The largest LBA whose byte offset fits in a `u64`.
+///
+/// A sector number this crate accepts has to be multipliable by
+/// [`SECTOR_SIZE`] without wrapping, because that product is the offset
+/// every read and write is issued at.
+const MAX_LBA: u64 = u64::MAX / SECTOR_SIZE;
+
 /// The shape of a GPT's entry array, and the usable range that follows
 /// from it.
 ///
@@ -124,6 +131,56 @@ impl GptGeometry {
                 "a GPT entry array starting at or before the header",
             ));
         }
+        // Every LBA this geometry names has to have a byte offset.
+        //
+        // This is the bound that makes the arithmetic below total, and
+        // it is here — in the shape check, before anything is written —
+        // rather than as a checked add at each site, because *where the
+        // refusal happens* is the defect rather than *whether* it
+        // happens.
+        //
+        // `write_gpt_with_geometry` writes the protective MBR at LBA 0
+        // and the primary header at LBA 1 before it ever touches the
+        // entry array. With `entry_lba` near `u64::MAX` the sum below
+        // wraps in a release build, the `DeviceTooSmall` refusal is
+        // stepped over, and the failure arrives later — after those two
+        // sectors have been rewritten. The caller is handed an `Err`
+        // and a torn table, which is worse than either a clean refusal
+        // or a clean write. Checked arithmetic at the point of use
+        // would turn the wrap into an error and leave that ordering
+        // exactly as it is.
+        //
+        // Not reachable from a disk: `gpt::parse_entry_array` multiplies
+        // `partition_entry_lba` through `checked_mul` and refuses an
+        // array reaching past the device, so `from_probe` cannot build
+        // such a geometry. The exposure is a directly-constructed one,
+        // which the public fields permit.
+        if self.entry_lba > MAX_LBA {
+            return Err(Error::Invalid(
+                "a GPT entry array at an LBA whose byte offset does not fit a u64",
+            ));
+        }
+        let array_sectors = self.array_sectors();
+        if array_sectors > MAX_LBA {
+            return Err(Error::Invalid(
+                "a GPT entry array longer than any device could hold",
+            ));
+        }
+        // The two together, because the first usable LBA is their sum
+        // and the backup reserve is one more than the array.
+        // `>` and not `>=`: an array ending exactly at `MAX_LBA` names
+        // no LBA whose byte offset is unrepresentable, so refusing it
+        // would be one sector too strict. The two differ at exactly one
+        // value and there is a test at it.
+        if self
+            .entry_lba
+            .checked_add(array_sectors)
+            .is_none_or(|first| first > MAX_LBA)
+        {
+            return Err(Error::Invalid(
+                "a GPT whose entry array ends past the last addressable LBA",
+            ));
+        }
         Ok(())
     }
 
@@ -135,6 +192,9 @@ impl GptGeometry {
     /// the backup reserve begins, or the table would describe usable
     /// space on top of its own metadata.
     pub fn usable_range(&self, total_sectors: u64) -> Result<(u64, u64)> {
+        // `check_shape` is what makes the arithmetic here total: it
+        // bounds `entry_lba`, the array's sectors, and their sum below
+        // `MAX_LBA`, so neither this sum nor the reserve can wrap.
         self.check_shape()?;
         let first_possible = self.entry_lba + self.array_sectors();
         let reserve = self.backup_reserve_sectors();
@@ -528,6 +588,106 @@ mod geometry_tests {
             ..canonical()
         };
         assert_eq!(g.usable_range(SECTORS).unwrap(), (2048, SECTORS - 2048));
+    }
+
+    /// A geometry whose LBAs have no byte offset is refused, and the
+    /// bound has both ends.
+    ///
+    /// `MAX_LBA` is the largest sector number whose byte offset fits a
+    /// `u64`, so it is the last value that must be accepted and
+    /// `MAX_LBA + 1` the first that must be refused. A bound written
+    /// one either way passes one of these and fails the other.
+    ///
+    /// The accepted case is checked through `check_shape` rather than
+    /// through `usable_range`, because no device is that large: the
+    /// range would be refused as `DeviceTooSmall`, which is the right
+    /// answer for a different reason and would hide this one.
+    #[test]
+    fn the_addressable_lba_bound_is_checked_at_both_ends() {
+        let at_the_limit = GptGeometry {
+            entry_lba: MAX_LBA - 33,
+            ..canonical()
+        };
+        at_the_limit
+            .check_shape()
+            .expect("the last LBA with a byte offset is addressable");
+
+        let past_it = GptGeometry {
+            entry_lba: MAX_LBA + 1,
+            ..canonical()
+        };
+        match past_it.check_shape() {
+            Err(Error::Invalid(m)) => assert!(
+                m.contains("byte offset does not fit"),
+                "refused, but not for the offset: {m}"
+            ),
+            other => panic!("an LBA past the addressable range gave {other:?}"),
+        }
+    }
+
+    /// An entry array whose end runs past the addressable range is
+    /// refused even when its start does not, and the bound has both
+    /// ends.
+    ///
+    /// `entry_lba` alone is inside the bound in both cases here; it is
+    /// the array that pushes the sum. An array ending *exactly* at
+    /// `MAX_LBA` names no LBA whose byte offset is unrepresentable, so
+    /// it must be accepted — a check written `>=` refuses it, which is
+    /// one sector too strict and the failure that arrives as "this tool
+    /// will not write my disk".
+    ///
+    /// The accepted case goes through `check_shape` rather than
+    /// `usable_range` because no device is that large: the range would
+    /// come back `DeviceTooSmall`, which is right for another reason
+    /// and would hide this one.
+    #[test]
+    fn the_arrays_end_is_bounded_at_both_ends() {
+        let canonical_array = canonical().array_sectors();
+
+        let ends_exactly_at_the_limit = GptGeometry {
+            entry_lba: MAX_LBA - canonical_array,
+            ..canonical()
+        };
+        assert_eq!(
+            ends_exactly_at_the_limit.entry_lba + canonical_array,
+            MAX_LBA,
+            "the fixture does not end where this test says it does"
+        );
+        ends_exactly_at_the_limit
+            .check_shape()
+            .expect("an array ending at the last addressable LBA is addressable");
+
+        let one_past = GptGeometry {
+            entry_lba: MAX_LBA - canonical_array + 1,
+            ..canonical()
+        };
+        match one_past.check_shape() {
+            Err(Error::Invalid(m)) => assert!(
+                m.contains("ends past the last addressable LBA"),
+                "refused, but not for the array's end: {m}"
+            ),
+            other => panic!("an array ending one past the range gave {other:?}"),
+        }
+    }
+
+    /// The arithmetic that used to wrap now cannot be reached with the
+    /// values that wrapped it.
+    ///
+    /// `entry_lba: u64::MAX` panicked in a debug build and, in release,
+    /// wrapped `entry_lba + array_sectors` to 31 — which is below the
+    /// device's sector count, so the `DeviceTooSmall` refusal was
+    /// stepped over and the writer carried on.
+    #[test]
+    fn the_geometry_that_wrapped_is_refused_rather_than_wrapping() {
+        let g = GptGeometry {
+            entry_lba: u64::MAX,
+            ..canonical()
+        };
+        assert!(g.usable_range(131_072).is_err());
+        assert!(
+            g.check_shape().is_err(),
+            "the refusal is in the shape check"
+        );
     }
 
     /// Each way a geometry can fail to describe a table, refused with
