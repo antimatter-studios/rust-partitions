@@ -68,9 +68,25 @@ tasks:
       - '{{.OUT}}/include/{{.LIBNAME}}.h'
 
     cmds:
-      # Idempotent: rustup answers "up to date" without touching the network
-      # when the target is already installed. It runs here rather than in the
-      # consumer because the triple is ours.
+      # THE HEADER CHECK IS THE TEST, NOT A SECOND COPY OF IT.
+      #
+      # This was a shell fragment that grepped the header and compared
+      # what it found against `lib{{.LIBNAME}}.a` -- a value derived
+      # from the same hand-maintained LIBNAME variable it was checking.
+      # A LIBNAME/Cargo.toml drift, which is precisely what it existed
+      # to catch, passed it silently: rename `[lib] name` and cargo
+      # builds a different artefact while the guard compares LIBNAME
+      # against itself and agrees. A check whose two sides come from one
+      # source cannot fail.
+      #
+      # tests/header_names_the_built_library.rs derives the expected
+      # name from Cargo.toml's `[lib] name` -- the thing that actually
+      # decides the artefact -- with a real TOML parser rather than a
+      # line scan. Running it here means one implementation instead of
+      # two, and the one that is already exercised by CI.
+      #
+      # It stays FIRST so a mismatch costs no release build.
+      - 'cargo test --locked --test header_names_the_built_library'
       - 'rustup target add {{.TRIPLE}}'
       - 'cargo build --release --target {{.TRIPLE}}'
       - 'mkdir -p "{{.OUT}}/include"'
