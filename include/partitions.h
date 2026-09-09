@@ -13,7 +13,12 @@
  *   6. fs_core_device_close(slice), partitions_list_free(list),
  *      fs_core_device_close(dev)
  *
- * Link with libam_partitions.a and include this header alongside fs_core.h.
+ * Link with libpartitions.a and include this header alongside fs_core.h.
+ *
+ * `chore staticlib` builds that library and copies both headers beside
+ * it; `chore artifact` prints the absolute path of the directory
+ * holding them. That contract lives in chores.yml, which is not
+ * anywhere a C consumer would look, so it is repeated here.
  *
  * MIT license. (c) 2026 Antimatter Studios.
  */
