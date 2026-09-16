@@ -57,7 +57,10 @@ fn run_scripts(doc: &Yaml) -> Vec<(String, String)> {
 /// being run is not read as cargo's.
 fn cargo_invocations(script: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    for command in script.split(['\n', ';']).flat_map(|c| c.split("&&")) {
+    // A backslash-newline continues the line; `;`, `&&`, `||`, `|`, `&`
+    // and a subshell's parentheses all start another command.
+    let joined = script.replace("\\\n", " ");
+    for command in joined.split(['\n', ';', '|', '&', '(', ')']) {
         let words: Vec<&str> = command.split_whitespace().collect();
         // The command word, past `env` and `VAR=value` prefixes. A
         // `cargo` anywhere else is an argument (`echo cargo publish`).
@@ -124,6 +127,36 @@ fn fs_core_clone_refs(yaml: &str) -> Vec<String> {
     refs
 }
 
+/// Every job or step that sets `var` in its own `env:`, shadowing the
+/// workflow-level value.
+fn env_overrides(doc: &Yaml, var: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(jobs) = doc.as_mapping_get("jobs").and_then(Yaml::as_mapping) else {
+        return out;
+    };
+    for (name, job) in jobs {
+        let name = name.as_str().unwrap_or("?");
+        if job
+            .as_mapping_get("env")
+            .and_then(|e| e.as_mapping_get(var))
+            .is_some()
+        {
+            out.push(format!("job {name}"));
+        }
+        let steps = job.as_mapping_get("steps").and_then(Yaml::as_sequence);
+        for (i, step) in steps.into_iter().flatten().enumerate() {
+            if step
+                .as_mapping_get("env")
+                .and_then(|e| e.as_mapping_get(var))
+                .is_some()
+            {
+                out.push(format!("job {name} step {i}"));
+            }
+        }
+    }
+    out
+}
+
 fn workflow() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(WORKFLOW);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {WORKFLOW}: {e}"))
@@ -154,6 +187,12 @@ fn the_fs_core_sibling_tag_is_stated_once() {
         "every rust-fs-core clone must use {shared} so a bump cannot give the jobs \
          different siblings; found {refs:?}"
     );
+    let overrides = env_overrides(&load(&yaml), "FS_CORE_REF");
+    assert!(
+        overrides.is_empty(),
+        "FS_CORE_REF is set again below the workflow level, so a clone can resolve a \
+         different tag than the one declared once: {overrides:?}"
+    );
     let declared = load(&yaml)
         .as_mapping_get("env")
         .and_then(|e| e.as_mapping_get("FS_CORE_REF"))
@@ -179,6 +218,23 @@ fn the_readers_discriminate() {
     );
     let missing = unlocked("jobs:\n  a:\n    steps:\n      - run: cargo run -- --locked\n");
     assert_eq!(missing, vec!["a: cargo run"]);
+
+    // Commands a line-and-`&&` split would miss.
+    for (script, want) in [
+        ("cargo \\\n  publish", "a: cargo publish"),
+        ("git clean -xfd || cargo publish", "a: cargo publish"),
+        ("true | cargo package", "a: cargo package"),
+        ("(cd x && cargo build)", "a: cargo build"),
+    ] {
+        let yaml = format!("jobs:\n  a:\n    steps:\n      - run: {script:?}\n");
+        assert_eq!(unlocked(&yaml), vec![want], "{script:?}");
+    }
+
+    let shadowed = "env:\n  FS_CORE_REF: v1\njobs:\n  a:\n    env:\n      FS_CORE_REF: v2\n    steps:\n      - env:\n          FS_CORE_REF: v3\n        run: echo\n";
+    assert_eq!(
+        env_overrides(&load(shadowed), "FS_CORE_REF"),
+        vec!["job a", "job a step 0"]
+    );
 
     let clones = "jobs:\n  a:\n    steps:\n      - run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
     assert_eq!(fs_core_clone_refs(clones), vec!["v0.2.10"]);
