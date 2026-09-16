@@ -1533,6 +1533,28 @@ fn a_4kn_gpt_disk_is_refused_by_its_sector_size() {
     }
 }
 
+/// A 4Kn GPT disk with a HYBRID MBR is still refused by its sector size.
+///
+/// The gate that stops a nested image's header being taken for 4Kn (#68)
+/// first required a protective MBR, which is one `0xEE` entry alone. A
+/// hybrid carries mirrored entries beside the marker, so this disk fell
+/// through to the MBR branch and its LBAs were read as 512-byte sectors
+/// -- offsets eight times too small, silently, where it had been refused.
+/// Found by Greptile on #108.
+#[test]
+fn a_4kn_gpt_disk_with_a_hybrid_mbr_is_still_refused_by_its_sector_size() {
+    let dev = Bytes::new(64 * 1024 * 1024);
+    build_gpt_4kn(&dev, 1, true);
+    // A mirrored real partition in slot 1, beside the marker in slot 0.
+    dev.write(446 + 16 + 4, &[0x83]);
+    dev.write_u32_le(446 + 16 + 8, 256);
+    dev.write_u32_le(446 + 16 + 12, 256);
+    match probe(&dev) {
+        Err(Error::UnsupportedSectorSize(msg)) => assert!(msg.contains("4096"), "{msg}"),
+        other => panic!("a 4Kn hybrid was not refused by its sector size: {other:?}"),
+    }
+}
+
 /// The detection needs a header whose CRC checks out.
 ///
 /// Byte 4096 on a 512-byte-sector disk is inside the entry array, where
