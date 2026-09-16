@@ -121,6 +121,15 @@ impl GptGeometry {
         if self.num_entries == 0 {
             return Err(Error::Invalid("a GPT with no entry slots"));
         }
+        // The reader's upper bounds too, for the same reason as the shape
+        // check below: `128 * 2^n` alone accepts 8192, which `parse_header`
+        // refuses, so the writer produced a table this crate cannot read.
+        if self.num_entries > 4096 {
+            return Err(Error::Invalid("a GPT with more than 4096 entry slots"));
+        }
+        if self.entry_size > 4096 {
+            return Err(Error::Invalid("a GPT entry size above 4096 bytes"));
+        }
         if self.entry_size < ENTRY_SIZE {
             return Err(Error::Invalid("a GPT entry size below 128 bytes"));
         }
@@ -796,6 +805,20 @@ mod geometry_tests {
                     ..canonical()
                 },
                 "128 times a power of two",
+            ),
+            (
+                GptGeometry {
+                    entry_size: 8192,
+                    ..canonical()
+                },
+                "above 4096 bytes",
+            ),
+            (
+                GptGeometry {
+                    num_entries: 4097,
+                    ..canonical()
+                },
+                "more than 4096 entry slots",
             ),
             (
                 GptGeometry {
