@@ -1962,3 +1962,121 @@ fn a_commit_mut_whose_flush_fails_records_no_slots() {
     assert!(set.commit_mut(&dev).is_err());
     assert_eq!(set.partitions[0].slot, None);
 }
+
+/// An extended container is a range, and a new partition stays out of it
+/// (#67).
+///
+/// `add`, `find_free` and the writer's overlap pass walked only the
+/// volumes, and the container is a preserved entry rather than a volume,
+/// so nothing checked a new partition against it. Measured before the
+/// fix on this layout: `add` placed the new partition at LBA 4096..12287,
+/// over the container at 8192..24575, and `commit` returned `Ok(())` --
+/// every logical partition chained inside it now inside another
+/// partition's range.
+///
+/// The second layout puts the container BELOW the volume, so a search
+/// that took the ranges in any order but the disk's would try the gap
+/// before the volume first and land in the container.
+#[test]
+fn a_new_partition_is_not_placed_over_an_extended_container() {
+    for (volume, container) in [
+        ((2048u32, 2048u32), (8192u32, 16384u32)),
+        ((16384, 2048), (2048, 8192)),
+    ] {
+        let dev = MemDev::new(DISK_64M as usize);
+        plant_mbr_entry(&dev, 0, 0x83, volume.0, volume.1);
+        plant_mbr_entry(&dev, 1, 0x0F, container.0, container.1);
+        let (c_start, c_end) = (
+            u64::from(container.0),
+            u64::from(container.0 + container.1 - 1),
+        );
+
+        let mut set = PartitionSet::from_probe(&dev).unwrap();
+        let idx = set
+            .add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+            .unwrap_or_else(|e| panic!("container at {c_start}..{c_end}: add refused: {e:?}"));
+        let (start, end) = set.partitions[idx].sector_span().unwrap();
+        assert!(
+            end < c_start || start > c_end,
+            "add placed the new partition at LBA {start}..{end}, over the container at \
+             {c_start}..{c_end}"
+        );
+        set.commit(&dev).unwrap();
+    }
+}
+
+/// The explicit spellings of the same mistake are refused by name: a
+/// start hint inside the container, a resize that grows a volume into
+/// it, and a partition moved over it by hand, which only the writer's
+/// own overlap pass can see.
+#[test]
+fn a_partition_hinted_resized_or_moved_into_an_extended_container_is_refused() {
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0x83, 2048, 2048);
+    plant_mbr_entry(&dev, 1, 0x0F, 8192, 16384);
+    let before = mbr_table(&dev);
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let hinted = set.add(
+        Some(16384 * 512),
+        ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        None,
+    );
+    assert!(
+        matches!(hinted, Err(Error::Invalid(m)) if m.contains("overlaps")),
+        "a hint inside the container gave {hinted:?}"
+    );
+    let resized = set.resize(PartitionRef::Index(0), 8 * ONE_MIB);
+    assert!(
+        matches!(resized, Err(Error::Invalid(m)) if m.contains("overlap")),
+        "a resize into the container gave {resized:?}"
+    );
+
+    let idx = set
+        .add(
+            Some(32 * ONE_MIB),
+            ONE_MIB,
+            PartitionTypeId::LinuxFilesystem,
+            None,
+        )
+        .unwrap();
+    set.partitions[idx].start = 12288 * 512;
+    let committed = set.commit(&dev);
+    assert!(
+        matches!(committed, Err(Error::Invalid(m)) if m.contains("overlap")),
+        "a partition moved over the container was committed: {committed:?}"
+    );
+    assert_eq!(mbr_table(&dev), before, "a refused commit wrote the table");
+}
+
+/// What must NOT count as a range: a `0xEE` marker, which spans the
+/// whole disk by design -- or, on some hybrids, only the GPT's region,
+/// which is why it is exempt by type and not by span -- and an entry
+/// whose sector count is zero, planted at LBA 0 where `start + count - 1`
+/// has nothing to subtract from.
+#[test]
+fn a_protective_marker_or_an_empty_entry_does_not_block_a_new_partition() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let total_sectors = (DISK_64M / 512) as u32;
+    plant_mbr_entry(&dev, 0, 0xEE, 1, total_sectors - 1);
+    plant_mbr_entry(&dev, 1, 0x0F, 0, 0);
+    plant_mbr_entry(&dev, 2, 0x83, 2048, 2048);
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .expect("the whole-disk marker and an empty entry claim no range");
+    set.commit(&dev).unwrap();
+
+    // A hybrid whose marker covers only the GPT region, where the new
+    // partition then goes, is exempt the same way.
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0xEE, 1, 2047);
+    plant_mbr_entry(&dev, 1, 0x83, 8192, 2048);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let idx = set
+        .add(Some(512), ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    assert_eq!(set.partitions[idx].start, 2048 * 512);
+    set.commit(&dev).unwrap();
+}

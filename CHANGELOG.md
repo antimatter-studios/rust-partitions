@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A new partition is not placed over an MBR extended container.** `add`,
+  `find_free`, `resize` and the MBR writer's overlap pass walked only the
+  volumes, and the container is a preserved entry, so `add` placed a
+  partition over it and `commit` returned `Ok(())`. `ReservedEntry::span`
+  gives each preserved entry's range -- none for a `0xEE` marker, by type,
+  or an entry with no sectors -- and all four now respect it (#67).
 - **`slot` is documented as zero-based.** `Partition::slot`,
   `PartitionInfo.slot` and `include/partitions.h` said the slot *was* the
   `3` in `/dev/sda3`, while the value is the entry's zero-based position
