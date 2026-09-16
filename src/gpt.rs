@@ -625,7 +625,7 @@ pub fn validate_backup(dev: &dyn BlockRead, primary: &[Partition]) -> BackupStat
             return BackupStatus::Mismatch("partition type differs");
         }
         // The slot is a partition's identity to everything above this
-        // crate — the `3` in `/dev/sda3` — which is why both parsers
+        // crate — slot 2 is `/dev/sda3` — which is why both parsers
         // take it from the entry's array index rather than from its
         // position in the list. A backup that files the same partition
         // in a different slot renumbers the disk the moment firmware or

@@ -88,12 +88,13 @@ typedef struct {
     uint8_t        _pad2[7];        /* alignment */
     uint64_t       attributes;      /* GPT attributes (entry offset +48);
                                      * 0 for MBR and whole-device entries */
-    int32_t        slot;            /* the entry's slot in the on-disk table —
-                                     * the partition's number to the rest of
-                                     * the system — or -1 when it has none.
-                                     * A table with a hole in it is routine,
-                                     * so the index passed to partitions_get
-                                     * is not the partition's number */
+    int32_t        slot;            /* the entry's ZERO-BASED slot in the
+                                     * on-disk table, or -1 when it has none.
+                                     * The first entry is slot 0; the system's
+                                     * number (N in /dev/sdaN, diskXsN) is
+                                     * slot + 1. A table with a hole in it is
+                                     * routine, so the index passed to
+                                     * partitions_get is not the slot */
     uint32_t       issues;          /* which of the table's own rules this
                                      * entry breaks, as PartitionsEntryIssue
                                      * bits; 0 when it breaks none. Occupies

@@ -643,7 +643,7 @@ fn write_mbr_refuses_a_span_that_leaves_a_u64() {
 // ---------------------------------------------------------------------------
 
 /// A partition's slot in the on-disk table is its identity to the rest
-/// of the system — the `3` in `/dev/sda3`, the `s3` in `disk4s3`. A GPT
+/// of the system — zero-based, so slot 2 is `/dev/sda3` and `disk4s3`. A GPT
 /// with a hole in it is routine: it is what a deletion leaves, and it is
 /// the normal state of a macOS disk, where slot numbering is not
 /// compacted.
@@ -1414,7 +1414,7 @@ fn edit_backup_entries(dev: &MemDev, edit: impl FnOnce(&mut [u8])) {
 /// identical to the primary.
 ///
 /// `slot` is a partition's identity to everything above this crate —
-/// the `3` in `/dev/sda3` — which is why both parsers take it from the
+/// slot 2 is `/dev/sda3` — which is why both parsers take it from the
 /// entry's array index rather than from its position in the list. A
 /// backup that disagrees about it renumbers the disk the moment
 /// firmware or a recovery tool falls back to it, and every fstab entry
@@ -1857,5 +1857,30 @@ fn a_start_hint_below_the_usable_range_is_raised_to_it() {
             .add(Some(0), ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
             .unwrap_or_else(|e| panic!("{kind:?}: add(Some(0)) refused: {e:?}"));
         assert_eq!(set.partitions[idx].start, ONE_MIB, "{kind:?}: add(Some(0))");
+    }
+}
+
+/// `slot` is zero-based on both table types: the first two partitions
+/// this crate writes read back as slots 0 and 1, which the system names
+/// `sda1`/`disk4s1` and `sda2`/`disk4s2`. The docs said the slot *was*
+/// the `3` in `/dev/sda3` while the value was one lower (#57); they now
+/// say `slot + 1`, and this pins the value they describe.
+#[test]
+fn the_first_two_partitions_written_read_back_as_slots_zero_and_one() {
+    for table in [TableKind::Gpt, TableKind::Mbr] {
+        let dev = MemDev::new(DISK_64M as usize);
+        let mut set = match table {
+            TableKind::Gpt => PartitionSet::empty_gpt(DISK_64M),
+            TableKind::Mbr => PartitionSet::empty_mbr(DISK_64M),
+        };
+        set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+            .unwrap();
+        set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+            .unwrap();
+        set.commit(&dev).unwrap();
+        let (_, mut parts) = probe(&dev).unwrap();
+        parts.sort_by_key(|p| p.start);
+        let slots: Vec<Option<u32>> = parts.iter().map(|p| p.slot).collect();
+        assert_eq!(slots, vec![Some(0), Some(1)], "{table:?}");
     }
 }

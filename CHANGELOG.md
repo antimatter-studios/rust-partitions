@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **`slot` is documented as zero-based.** `Partition::slot`,
+  `PartitionInfo.slot` and `include/partitions.h` said the slot *was* the
+  `3` in `/dev/sda3`, while the value is the entry's zero-based position
+  in the table, one lower. The value is unchanged; the docs now say the
+  system's number is `slot + 1`, and a test pins slots 0 and 1 for the
+  first two partitions written on both table types (#57).
 - **`Partition::issues` follows `remove` and `resize` on a GPT set.**
   The flags were computed once by `probe`, so removing one of an
   overlapping pair left the survivor reporting `OVERLAPS_ANOTHER`, and

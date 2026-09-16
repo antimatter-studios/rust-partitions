@@ -448,7 +448,7 @@ pub fn write_gpt_preserving_tails(
 /// Which table slot each partition is written into.
 ///
 /// A partition's slot is its identity to everything above this crate —
-/// the `3` in `/dev/sda3` — so a partition that came off a disk goes
+/// slot 2 is `/dev/sda3` — so a partition that came off a disk goes
 /// back into the slot it came from. Writing each one into the slot
 /// matching its position in the `Vec`, which is what this used to do,
 /// compacts a table with a hole in it and renumbers every partition
