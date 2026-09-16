@@ -937,26 +937,37 @@ fn mbr_table(dev: &MemDev) -> [u8; 64] {
 /// from_probe saw 1 partitions
 /// slot1 type after  = 0x00
 /// ```
+///
+/// The Linux container `0x85` too, which was reported as a volume and so
+/// written back from this crate's understanding rather than its original
+/// bytes: the CHS fields planted below came back as zeros (#70).
 #[test]
 fn a_commit_that_changed_nothing_keeps_the_extended_container() {
-    let dev = MemDev::new(DISK_64M as usize);
-    plant_mbr_entry(&dev, 0, 0x83, 2048, 2048);
-    // 0x0F: an extended container, LBA-addressed. Its contents are EBRs.
-    plant_mbr_entry(&dev, 1, 0x0F, 8192, 16384);
+    // 0x0F: an extended container, LBA-addressed; 0x85: Linux's. Their
+    // contents are EBRs.
+    for container in [0x0Fu8, 0x85] {
+        let dev = MemDev::new(DISK_64M as usize);
+        plant_mbr_entry(&dev, 0, 0x83, 2048, 2048);
+        plant_mbr_entry(&dev, 1, container, 8192, 16384);
+        // The container's CHS start and end, which only a byte-for-byte
+        // preservation keeps.
+        dev.0.lock().unwrap()[446 + 16 + 1..446 + 16 + 4].copy_from_slice(&[0x21, 0x03, 0x00]);
+        dev.0.lock().unwrap()[446 + 16 + 5..446 + 16 + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
 
-    let before = mbr_table(&dev);
-    let set = PartitionSet::from_probe(&dev).unwrap();
-    set.commit(&dev).unwrap();
-    let after = mbr_table(&dev);
+        let before = mbr_table(&dev);
+        let set = PartitionSet::from_probe(&dev).unwrap();
+        set.commit(&dev).unwrap();
+        let after = mbr_table(&dev);
 
-    assert_eq!(
-        after,
-        before,
-        "a commit that changed nothing rewrote the table; \
-         slot 1 type is {:#04x} where it was {:#04x}",
-        after[16 + 4],
-        before[16 + 4]
-    );
+        assert_eq!(
+            after,
+            before,
+            "type {container:#04x}: a commit that changed nothing rewrote the table; \
+             slot 1 type is {:#04x} where it was {:#04x}",
+            after[16 + 4],
+            before[16 + 4]
+        );
+    }
 }
 
 /// The same round trip on a hybrid MBR, which is what a bootable
