@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A GPT image nested in an MBR disk no longer makes the disk "4Kn".**
+  `probe` refused any disk whose byte 4096 parsed as a GPT header with
+  `my_lba == 1`, which a disk image stored at LBA 7 of an ordinary MBR
+  disk provides, so the outer disk's partitions were unreachable behind
+  `UnsupportedSectorSize`. The 4Kn check now runs only when LBA 0 is a
+  protective MBR (#68).
 - **`slot` is documented as zero-based.** `Partition::slot`,
   `PartitionInfo.slot` and `include/partitions.h` said the slot *was* the
   `3` in `/dev/sda3`, while the value is the entry's zero-based position

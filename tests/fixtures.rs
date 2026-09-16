@@ -1474,6 +1474,44 @@ fn build_gpt_4kn(dev: &Bytes, my_lba: u64, repair_crc: bool) {
     dev.write(BS as usize, &header);
 }
 
+/// A disk image nested inside an ordinary MBR disk is not a 4Kn disk.
+///
+/// The 4Kn test asked only whether byte 4096 parses as a GPT header with
+/// `my_lba == 1`. A GPT image stored at LBA 7 of an MBR disk puts its
+/// own LBA 1 exactly there, genuine CRC and all, so the outer disk was
+/// refused as `UnsupportedSectorSize` and its real partitions were
+/// unreachable (#68). A 4Kn GPT disk also carries a protective MBR in
+/// its first 512 bytes; this one carries an ordinary MBR.
+#[test]
+fn a_gpt_image_nested_at_byte_3584_of_an_mbr_disk_is_not_taken_for_4kn() {
+    let inner = Bytes::new(4 * 1024 * 1024);
+    build_gpt_with_entries(
+        &inner,
+        &[(type_guids::LINUX_FILESYSTEM, [9u8; 16], 2048, 4095, "inner")],
+    );
+    let outer = Bytes::new(16 * 1024 * 1024);
+    outer.write(3584, &inner.0.lock().unwrap());
+    // The outer disk's own MBR, written after the copy (which starts
+    // past LBA 0 anyway).
+    write_mbr_entry(&outer, 0, 0x83, 16384, 8192);
+    outer.write(510, &[0x55, 0xAA]);
+
+    let mut at_4096 = [0u8; 8];
+    outer.read_at(4096, &mut at_4096).unwrap();
+    assert_eq!(
+        &at_4096, b"EFI PART",
+        "fixture: the nested header sits at byte 4096"
+    );
+
+    match probe(&outer) {
+        Ok((TableKind::Mbr, parts)) => {
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].start, 16384 * 512);
+        }
+        other => panic!("an MBR disk holding a nested GPT image gave {other:?}"),
+    }
+}
+
 /// A healthy 4Kn GPT disk is refused by name, not reported as corrupt.
 ///
 /// Before this it came back as

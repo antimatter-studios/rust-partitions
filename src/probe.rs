@@ -223,8 +223,20 @@ pub fn probe(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>)> {
     // offset in this crate, which is a real piece of work and is not
     // this. Saying which disk it is beats describing a corruption that
     // is not there.
-    if let Some(why) = looks_like_4kn_gpt(dev) {
-        return Err(Error::UnsupportedSectorSize(why));
+    //
+    // Only a disk that also looks like a GPT disk at LBA 0 — a protective
+    // MBR — is asked. Byte 4096 of an ordinary MBR disk can hold a whole
+    // GPT header that belongs to something else: a disk image stored at
+    // LBA 7 puts its own LBA 1 exactly there, CRC and `my_lba` included,
+    // and that disk was refused as 4Kn with its real partitions
+    // unreachable (#68). A 4Kn disk whose LBA 0 is not a lone `0xEE`
+    // (a 4Kn hybrid) is not named here either; it falls through to the
+    // MBR branch, which is the documented 4Kn-MBR limitation, and must
+    // not be "fixed" by removing this gate.
+    if has_mbr_sig && mbr::is_protective(&lba0) {
+        if let Some(why) = looks_like_4kn_gpt(dev) {
+            return Err(Error::UnsupportedSectorSize(why));
+        }
     }
 
     if has_mbr_sig {
