@@ -105,17 +105,27 @@ impl Partition {
     /// carries an ending LBA below its starting LBA and no reader will
     /// take it.
     ///
-    /// A zero-length partition has no last sector, and computing one
-    /// underflows for the same reason. Neither shape describes a range
-    /// that can be reasoned about, so both are refused rather than
-    /// guessed at.
+    /// A zero-length partition has no last sector, wherever it starts,
+    /// so it is refused by testing the length — not by waiting for
+    /// `end / SECTOR_SIZE - 1` to underflow, which only happens below
+    /// the first sector boundary and elsewhere returned a span whose
+    /// first sector is past its last (#71). Neither shape describes a
+    /// range that can be reasoned about, so both are refused rather
+    /// than guessed at.
+    ///
+    /// The last sector is the one holding the partition's last byte, so
+    /// a length that ends partway into a sector counts that sector.
     pub fn sector_span(&self) -> Result<(u64, u64)> {
+        if self.length == 0 {
+            return Err(Error::Invalid("a partition has no last sector"));
+        }
         let end = self.start.checked_add(self.length).ok_or(Error::Invalid(
             "a partition's start and length overflow a u64",
         ))?;
-        let last = (end / crate::SECTOR_SIZE)
-            .checked_sub(1)
-            .ok_or(Error::Invalid("a partition has no last sector"))?;
+        // `length` is non-zero, so `end - 1` is the partition's last byte
+        // and cannot underflow. Dividing that byte, rather than `end`,
+        // counts a sector the partition only partly occupies.
+        let last = (end - 1) / crate::SECTOR_SIZE;
         Ok((self.start / crate::SECTOR_SIZE, last))
     }
 
