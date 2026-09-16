@@ -679,6 +679,13 @@ fn scan_shell(line: &str) -> ShellScan {
                         spans.push(None);
                     } else if !inner.starts_with('(') {
                         spans.push(Some(inner));
+                    } else if runs_a_substitution(&inner) {
+                        // Arithmetic that runs a substitution: that one's
+                        // status is the command's
+                        // (`x=$(false) y=$(( $(true; echo 1) + 1 ))` exits
+                        // 0), and it is not followed (Greptile on
+                        // rust-img-vmdk#102).
+                        spans.push(None);
                     }
                     close + 1
                 }
@@ -730,7 +737,7 @@ fn scan_shell(line: &str) -> ShellScan {
                     // substitution runs it, and this file does not follow
                     // it (`x=$(false) y=${z:-$(true)}` exits 0).
                     let text: String = chars[i..=close].iter().collect();
-                    if text[2..].contains("$(") || text.contains('`') {
+                    if runs_a_substitution(&text[2..]) {
                         spans.push(None);
                     }
                     close + 1
@@ -1989,6 +1996,22 @@ fn withdraws_the_handshake(words: &[String]) -> bool {
     })
 }
 
+/// Whether `text` runs a command substitution: a backtick, or `$(` that is
+/// not the `$((` of arithmetic. A substitution inside arithmetic is still
+/// found, on its own `$(` further on.
+///
+/// Arithmetic is not a substitution and leaves the last real one deciding
+/// (`x=$(false) y=${z:-$((1+1))}` exits 1), so a plain `contains("$(")`
+/// took `$((` for one and refused a gate (Greptile on
+/// rust-partitions#112).
+fn runs_a_substitution(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.contains(&b'`')
+        || b.windows(3)
+            .any(|w| w[0] == b'$' && w[1] == b'(' && w[2] != b'(')
+        || b.ends_with(b"$(")
+}
+
 /// Words that begin, continue or end a compound command, where the
 /// shell's reading of an `export` inside depends on control flow and
 /// redirection this file does not track.
@@ -3240,6 +3263,7 @@ cargo build --locked --release
             "x=$(cargo test --locked --lib) y=\"$((1+1))\"",
             "x=$(cargo test --locked --lib) y=\"a$((2*3))b\"",
             "x=$(cargo test --locked --lib) y=${z}",
+            "x=$(cargo test --locked --lib) y=${z:-$((1+1))}",
             "x=$(cargo test --locked --lib;)",
         ];
         for line in lines {
@@ -3250,7 +3274,7 @@ cargo build --locked --release
                  command's, so the cargo test inside it gates the step"
             );
         }
-        assert_eq!(lines.len(), 15, "every shape above must have been examined");
+        assert_eq!(lines.len(), 16, "every shape above must have been examined");
     }
 
     /// AND THE SUBSTITUTIONS THAT DO SWALLOW IT, measured the same way:
@@ -3272,6 +3296,8 @@ cargo build --locked --release
             "x=$(cargo test --locked --lib) y=${z:-$(true)}",
             // Arithmetic that runs a substitution: that one decides.
             "x=$(cargo test --locked --lib) y=\"$((1+$(true; echo 1)))\"",
+            "x=$(cargo test --locked --lib) N=$(( $(true; printf 1) + 1))",
+            "x=$(cargo test --locked --lib) y=$((1+`true; echo 1`))",
             "x=$(cargo test --locked --lib) y=\"$(true)\"",
             "x=$(cargo test --locked --lib) || true",
             "x=$(cargo test --locked --lib) && echo ok\necho after\n",
@@ -3285,7 +3311,7 @@ cargo build --locked --release
                 "{line:?}: the step's status does not depend on the suite's"
             );
         }
-        assert_eq!(lines.len(), 15, "every shape above must have been examined");
+        assert_eq!(lines.len(), 17, "every shape above must have been examined");
 
         // DELIBERATELY REFUSED, each a gate in bash: a quoted
         // substitution, a bare one whose output is redirected away, and
