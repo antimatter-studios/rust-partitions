@@ -3,7 +3,7 @@
 //! does NOT validate the filesystem — it just answers "what is this likely
 //! to be?" The driver itself does proper validation when mounting.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::probe::Partition;
 use crate::BlockRead;
 
@@ -59,19 +59,54 @@ pub enum ExtVersion {
 /// read for a partition `partitions_open_slice` opened happily, and the
 /// consumer had to explain why something it can read has no filesystem.
 ///
-/// A partition beginning past the end of the device has nothing to read
-/// and stays an error: clamping must not turn "there is no such region"
-/// into "an unrecognised filesystem". Everything `classify` looks at is
-/// already length-guarded, so a short window simply rules out the probes
-/// it cannot reach.
+/// A partition beginning at or past the end of the device has nothing to
+/// read and is an error, checked before the window is sized: clamping
+/// must not turn "there is no such region" into "an unrecognised
+/// filesystem". Everything `classify` looks at is already length-guarded,
+/// so a short window simply rules out the probes it cannot reach.
+///
+/// The window is [`WINDOW`] bytes, clamped to the partition's length.
 pub fn sniff(dev: &dyn BlockRead, partition: &Partition) -> Result<FsKind> {
-    // Largest window we need: 0x8001 + 5 bytes for ISO9660. Round up.
-    let want = std::cmp::min(0x8800u64, partition.length);
-    let available = dev.size_bytes().saturating_sub(partition.start);
+    let device_size = dev.size_bytes();
+    // Refused here rather than left to the read: a zero-length read is
+    // `Ok` at any offset on a real `FileDevice`, so the clamp below would
+    // otherwise hand `classify` an empty buffer and call a region that
+    // does not exist an unrecognised filesystem (#53).
+    if partition.start >= device_size {
+        return Err(Error::Block(fs_core::Error::ShortRead {
+            offset: partition.start,
+            want: std::cmp::min(WINDOW, partition.length) as usize,
+            got: 0,
+        }));
+    }
+    let want = std::cmp::min(WINDOW, partition.length);
+    let available = device_size - partition.start;
     let mut buf = vec![0u8; std::cmp::min(want, available) as usize];
     dev.read_at(partition.start, &mut buf)?;
     Ok(classify(&buf))
 }
+
+/// End of the ISO9660 `CD001` identifier: the furthest byte that probe reads.
+const ISO9660_END: usize = 0x8006;
+
+/// The Linux swap page sizes [`classify`] probes; `SWAPSPACE2` ends each one.
+const SWAP_PAGES: [usize; 5] = [4096, 8192, 16384, 32768, 65536];
+
+/// How many bytes [`sniff`] reads from the start of a partition: the end
+/// of the furthest probe [`classify`] makes.
+///
+/// Derived from the probes rather than written as a number, because it
+/// was once written as one — `0x8800`, sized for ISO9660 — while the swap
+/// probe reached 64 KiB, and that page was unreachable through `sniff`
+/// (#25).
+pub const WINDOW: u64 = {
+    let largest_page = SWAP_PAGES[SWAP_PAGES.len() - 1];
+    if largest_page > ISO9660_END {
+        largest_page as u64
+    } else {
+        ISO9660_END as u64
+    }
+};
 
 /// Stand-alone classifier — exposed for tests and for callers who already
 /// have the bytes in hand.
@@ -132,7 +167,7 @@ pub fn classify(buf: &[u8]) -> FsKind {
 
     // Linux swap: 'SWAPSPACE2' at (page_size - 10). Page can be 4096..65536.
     // Probe the common pages.
-    for page in [4096usize, 8192, 16384, 32768, 65536] {
+    for page in SWAP_PAGES {
         if buf.len() >= page {
             let off = page - 10;
             if &buf[off..off + 10] == b"SWAPSPACE2" {
@@ -142,7 +177,7 @@ pub fn classify(buf: &[u8]) -> FsKind {
     }
 
     // ISO 9660: 'CD001' at offset 0x8001.
-    if buf.len() >= 0x8006 && &buf[0x8001..0x8006] == b"CD001" {
+    if buf.len() >= ISO9660_END && &buf[0x8001..ISO9660_END] == b"CD001" {
         return FsKind::Iso9660;
     }
 

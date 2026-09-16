@@ -28,6 +28,12 @@ impl Bytes {
 
 impl BlockRead for Bytes {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        // As `FileDevice` does: an empty read succeeds at any offset. A
+        // mock that errored here let a test pass for the mock's reason
+        // rather than `sniff`'s (#53).
+        if buf.is_empty() {
+            return Ok(());
+        }
         let b = self.0.lock().unwrap();
         let start = offset as usize;
         let end = start + buf.len();
@@ -646,6 +652,135 @@ fn a_partition_beginning_past_the_end_is_still_an_error() {
     assert!(
         sniff::sniff(&dev, &part).is_err(),
         "a partition outside the device must not be classified"
+    );
+}
+
+/// The same rule against the device the C ABI actually hands `sniff`.
+///
+/// `Bytes` errors on a zero-length read past its end, and a real
+/// `FileDevice` does not: its read loop never runs for an empty buffer
+/// and it answers `Ok(())` at any offset. `sniff` clamped the window to
+/// the zero bytes available past the device and relied on the read to
+/// fail, so on a real file a region entirely off the device came back as
+/// `Ok(Unknown)` — while `partitions_open_slice` refuses the same entry
+/// as beginning past the end. The mock-only test above passed for the
+/// mock's reason. #53.
+#[test]
+fn a_partition_beginning_past_the_end_is_an_error_on_a_real_file_device() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("one-mib.img");
+    std::fs::write(&path, vec![0u8; 1024 * 1024]).unwrap();
+    let dev = fs_core::FileDevice::open(&path).unwrap();
+    // Exactly at the end, and well past it: neither has a byte to read.
+    for start in [1024 * 1024, 4 * 1024 * 1024] {
+        let part = Partition {
+            start,
+            length: 1024 * 1024,
+            kind: PartitionKind::Mbr {
+                type_byte: 0x83,
+                active: false,
+            },
+            label: None,
+            uuid: None,
+            slot: Some(0),
+            issues: 0,
+        };
+        let got = sniff::sniff(&dev, &part);
+        assert!(
+            got.is_err(),
+            "a partition starting at byte {start} of a 1 MiB FileDevice was classified as {got:?}"
+        );
+    }
+}
+
+/// `classify` probes for `SWAPSPACE2` at the end of a 4, 8, 16, 32 and
+/// 64 KiB page, and `sniff` read at most 0x8800 bytes — sized for
+/// ISO9660 alone — so the 64 KiB page, the one `mkswap` writes on a
+/// 64 KiB-page aarch64 or ppc64le kernel, could never be seen through
+/// `sniff`. The `classify` test above feeds its own buffer and hid it.
+/// #25.
+#[test]
+fn swap_is_sniffed_through_sniff_at_every_page_size_classify_probes() {
+    const START: u64 = 1024 * 1024;
+    for page in [4096usize, 8192, 16384, 32768, 65536] {
+        let dev = Bytes::new(8 * 1024 * 1024);
+        dev.write(START as usize + page - 10, b"SWAPSPACE2");
+        let part = Partition {
+            start: START,
+            length: 4 * 1024 * 1024,
+            kind: PartitionKind::Mbr {
+                type_byte: 0x82,
+                active: false,
+            },
+            label: None,
+            uuid: None,
+            slot: Some(0),
+            issues: 0,
+        };
+        assert_eq!(
+            sniff::sniff(&dev, &part).unwrap(),
+            FsKind::LinuxSwap,
+            "a swap signature for a {page}-byte page was not seen through sniff"
+        );
+    }
+}
+
+/// Sniff a whole device through the C ABI with a declared size.
+fn sniff_device_declaring(dev: Bytes, declared: u64) -> i32 {
+    let handle = fs_core::ffi::FsCoreDevice::into_handle(Arc::new(dev));
+    let rc = unsafe { partitions::capi::partitions_sniff_device(handle, declared) };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+    rc
+}
+
+/// `partitions_sniff_device` refused only a declared size of zero. Any
+/// other size too small to reach a probe gave `PART_FS_UNKNOWN` — the
+/// same `0` a device with nothing on it gives — so a real ISO9660 device
+/// declared at anything from 1 to 32768 bytes was indistinguishable from
+/// an empty one, and a caller could not tell whether to trust the
+/// negative. #83.
+///
+/// A single minimum cannot fix it: NTFS is recognisable in 512 bytes and
+/// ISO9660 needs 32774, so a floor safe for ISO would refuse a correct
+/// NTFS answer. What is refused is the one inconclusive shape — nothing
+/// recognised, in a window the declared size cut short of bytes the
+/// device actually has.
+#[test]
+fn sniff_device_does_not_report_unknown_for_a_window_the_declared_size_cut_short() {
+    const DEVICE: usize = 1024 * 1024;
+    let iso = || {
+        let dev = Bytes::new(DEVICE);
+        dev.write(0x8001, b"CD001");
+        dev
+    };
+    for declared in [1u64, 512, 1024, 32768] {
+        let rc = sniff_device_declaring(iso(), declared);
+        assert_ne!(
+            rc, 0,
+            "an ISO9660 device declared at {declared} bytes answered PART_FS_UNKNOWN, \
+             the answer an empty device gives"
+        );
+        assert_eq!(rc, -1, "declared {declared} bytes");
+    }
+    // Declared at its real size, the same device is recognised.
+    assert_eq!(sniff_device_declaring(iso(), DEVICE as u64), 11);
+
+    // A positive answer inside a short window is still an answer.
+    let ntfs = Bytes::new(DEVICE);
+    ntfs.write(3, b"NTFS    ");
+    ntfs.write(510, &[0x55, 0xAA]);
+    assert_eq!(sniff_device_declaring(ntfs, 512), 4);
+
+    // A device genuinely too small to hold the probes, declared at its
+    // real size, has been read to its end: that negative is conclusive.
+    assert_eq!(sniff_device_declaring(Bytes::new(1024), 1024), 0);
+    // And an empty device read through a full window is still Unknown.
+    assert_eq!(sniff_device_declaring(Bytes::new(DEVICE), DEVICE as u64), 0);
+    // A declared size that covers the whole sniff window read everything
+    // sniffing looks at, so its negative is conclusive too.
+    assert_eq!(
+        sniff_device_declaring(Bytes::new(DEVICE), partitions::sniff::WINDOW),
+        0
     );
 }
 
