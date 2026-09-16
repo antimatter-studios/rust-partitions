@@ -114,6 +114,68 @@ fn find_c_compiler() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A C compiler that builds for `triple`, the Rust target the test binary
+/// was built for.
+///
+/// `CC_<triple>` (with `-` or `_`) and then `TARGET_CC`, the variables cc-rs
+/// reads for the same purpose. Failing those, the host compiler, but only
+/// if `-dumpmachine` says it builds for the same architecture and system:
+/// `cargo test --target <triple>` on the machine that is that triple is the
+/// ordinary case, and it needs nothing set.
+fn target_c_compiler(triple: &str) -> Option<String> {
+    let underscored = triple.replace('-', "_");
+    for var in [
+        format!("CC_{triple}"),
+        format!("CC_{underscored}"),
+        "TARGET_CC".to_owned(),
+    ] {
+        if let Ok(cc) = std::env::var(&var) {
+            if !cc.is_empty() {
+                return Some(cc);
+            }
+        }
+    }
+    let cc = find_c_compiler()?;
+    let machine = Command::new(&cc).arg("-dumpmachine").output().ok()?;
+    let machine = String::from_utf8_lossy(&machine.stdout);
+    compiler_builds_for(machine.trim(), triple).then_some(cc)
+}
+
+/// Whether a compiler whose `-dumpmachine` is `machine` builds for the Rust
+/// target `triple`: same architecture (Apple spells aarch64 `arm64`) and
+/// same system.
+fn compiler_builds_for(machine: &str, triple: &str) -> bool {
+    let arch = |t: &str| match t.split('-').next().unwrap_or("") {
+        "arm64" => "aarch64".to_owned(),
+        other => other.to_owned(),
+    };
+    let system = |t: &str| {
+        ["linux", "darwin", "windows", "freebsd"]
+            .into_iter()
+            .find(|os| t.contains(os))
+    };
+    !machine.is_empty() && arch(machine) == arch(triple) && system(machine) == system(triple)
+}
+
+#[test]
+fn a_host_compiler_is_used_for_a_target_only_when_it_builds_for_it() {
+    for (machine, triple, same) in [
+        ("aarch64-linux-gnu", "aarch64-unknown-linux-gnu", true),
+        ("x86_64-linux-gnu", "x86_64-unknown-linux-gnu", true),
+        ("arm64-apple-darwin23.4.0", "aarch64-apple-darwin", true),
+        ("x86_64-linux-gnu", "aarch64-unknown-linux-gnu", false),
+        ("aarch64-linux-gnu", "aarch64-apple-darwin", false),
+        ("arm64-apple-darwin23.4.0", "x86_64-apple-darwin", false),
+        ("", "x86_64-unknown-linux-gnu", false),
+    ] {
+        assert_eq!(
+            compiler_builds_for(machine, triple),
+            same,
+            "{machine} for {triple}"
+        );
+    }
+}
+
 #[test]
 fn c_header_matches_rust_struct() {
     let Some(cc) = find_c_compiler() else {
@@ -316,15 +378,6 @@ fn c_header_functions_link_against_the_built_library() {
         eprintln!("skipping the C link check on Windows");
         return;
     }
-    let Some(cc) = find_c_compiler() else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "no C compiler found in CI — the C ABI link check would have been skipped"
-        );
-        eprintln!("no C compiler found (tried $CC, cc, clang, gcc); skipping C link check");
-        return;
-    };
-
     // `cargo test` builds the library as an rlib for the tests and does
     // not produce the staticlib, so build it here -- every time, so the
     // archive linked is this tree's and not a stale one left behind -- into
@@ -332,6 +385,38 @@ fn c_header_functions_link_against_the_built_library() {
     // built this test binary.
     let exe = std::env::current_exe().expect("test executable path");
     let (build_args, archive) = nested_build(&exe);
+    let triple = build_args
+        .iter()
+        .position(|a| a == "--target")
+        .and_then(|i| build_args.get(i + 1))
+        .cloned();
+
+    let cc = match &triple {
+        None => find_c_compiler(),
+        Some(triple) => match target_c_compiler(triple) {
+            Some(cc) => Some(cc),
+            None => {
+                // A `--target` build with no C compiler for that target:
+                // linking a host object against a foreign archive fails
+                // for a reason that has nothing to do with the ABI
+                // (Greptile on #111). Not a CI failure either -- cross
+                // runs set `CC_<triple>` when they want this check.
+                eprintln!(
+                    "no C compiler for {triple} (set CC_{} or TARGET_CC); skipping C link check",
+                    triple.replace('-', "_")
+                );
+                return;
+            }
+        },
+    };
+    let Some(cc) = cc else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no C compiler found in CI — the C ABI link check would have been skipped"
+        );
+        eprintln!("no C compiler found (tried $CC, cc, clang, gcc); skipping C link check");
+        return;
+    };
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let mut build = Command::new(&cargo);
     build.args(["build", "--locked", "--lib"]).args(&build_args);
