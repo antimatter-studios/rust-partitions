@@ -8,6 +8,13 @@ never does.
 
 ### Fixed
 
+- **`probe` reads LBA 1 instead of guessing from the device size.** A
+  device reporting a size below 1024 bytes -- `FileDevice` over a raw
+  device node reports 0 -- had LBA 1 skipped, so an intact GPT was called
+  "protective MBR present but no GPT signature", and the entry-array
+  bound refused it too. LBA 1 is now read, and only a read past the end,
+  or a device that stated its small size, means there is none; a size of
+  0 no longer bounds the entry array (#37).
 - **A GPT image nested in an MBR disk no longer makes the disk "4Kn".**
   `probe` refused any disk whose byte 4096 parsed as a GPT header with
   `my_lba == 1`, which a disk image stored at LBA 7 of an ordinary MBR
