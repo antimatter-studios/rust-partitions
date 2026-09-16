@@ -1090,6 +1090,77 @@ fn a_sound_entry_survives_removing_the_broken_ones() {
     assert_eq!(parts[0].issues, 0);
 }
 
+/// `Partition::issues` was computed once, by `probe`, and never again:
+/// `remove` was a bare `Vec::remove` and `resize` assigned the length
+/// and nothing else. Removing one of an overlapping pair left the
+/// survivor flagged `OVERLAPS_ANOTHER`, and shrinking an entry back
+/// inside the usable range left `PAST_LAST_USABLE` set — so a caller
+/// filtering on the flags discarded or warned about a partition that was
+/// now fine. Each answer below is also what `probe` says once the edited
+/// set is committed. #73.
+#[test]
+fn issues_follow_remove_and_resize_rather_than_staying_as_probed() {
+    use partitions::gpt::entry_issue;
+    use partitions::{PartitionRef, PartitionSet};
+
+    // Remove one of an overlapping pair.
+    let dev = WritableBytes(Bytes::new(8 * 1024 * 1024));
+    gpt_with_broken_entries(&dev.0);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.partitions[0].issues, entry_issue::OVERLAPS_ANOTHER);
+    set.remove(PartitionRef::Index(1)).unwrap();
+    assert_eq!(
+        set.partitions[0].issues,
+        entry_issue::NONE,
+        "the survivor of an overlapping pair still reports the overlap"
+    );
+    // The entry on top of the GPT still breaks its own rule.
+    assert_eq!(set.partitions[1].issues, entry_issue::BEFORE_FIRST_USABLE);
+
+    // Shrink an entry that ran past the last usable LBA back inside it.
+    let dev = WritableBytes(Bytes::new(8 * 1024 * 1024));
+    let total_sectors = 8 * 1024 * 1024 / 512;
+    build_gpt_with_entries(
+        &dev.0,
+        &[(
+            type_guids::LINUX_FILESYSTEM,
+            [4u8; 16],
+            2048,
+            total_sectors - 1,
+            "too-long",
+        )],
+    );
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.partitions[0].issues, entry_issue::PAST_LAST_USABLE);
+    set.resize(PartitionRef::Index(0), 1024 * 1024).unwrap();
+    assert_eq!(
+        set.partitions[0].issues,
+        entry_issue::NONE,
+        "a partition shrunk back inside the usable range still reports running past it"
+    );
+    set.commit(&dev).unwrap();
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts[0].issues, entry_issue::NONE);
+
+    // Shrink one of an overlapping pair out of the overlap.
+    let dev = WritableBytes(Bytes::new(8 * 1024 * 1024));
+    build_gpt_with_entries(
+        &dev.0,
+        &[
+            (type_guids::LINUX_FILESYSTEM, [5u8; 16], 2048, 8191, "a"),
+            (type_guids::LINUX_FILESYSTEM, [6u8; 16], 6144, 10239, "b"),
+        ],
+    );
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.partitions[1].issues, entry_issue::OVERLAPS_ANOTHER);
+    set.resize(PartitionRef::Index(0), 1024 * 1024).unwrap();
+    assert_eq!(
+        [set.partitions[0].issues, set.partitions[1].issues],
+        [entry_issue::NONE; 2],
+        "a pair shrunk apart still reports the overlap"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Each rule, pinned on its own
 //
