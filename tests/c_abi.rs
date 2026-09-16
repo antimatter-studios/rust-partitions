@@ -25,7 +25,7 @@
 
 use std::fs;
 use std::mem::{align_of, offset_of, size_of};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use partitions::capi::PartitionInfo;
@@ -219,6 +219,95 @@ fn the_declaration_scan_reads_declarations_and_not_comments() {
     );
 }
 
+/// The `cargo build` arguments that reproduce the build of the test binary
+/// at `exe`, and where that build puts `libpartitions.a`.
+///
+/// The binary is at `<target-dir>/[<triple>/]<profile-dir>/deps/<name>`.
+/// Forwarding `--release` alone put the archive somewhere else under
+/// `cargo test --target <triple>` or `--profile <custom>`, and the check
+/// failed with a correct ABI (Greptile on #111). The target directory is
+/// the one holding cargo's `CACHEDIR.TAG`; a directory between it and the
+/// profile is a target triple; and the profile directory is `debug` for
+/// the dev profile, `release` for release, or the custom profile's name.
+fn nested_build(exe: &Path) -> (Vec<String>, PathBuf) {
+    let profile_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("<profile-dir> above deps/");
+    let above = profile_dir.parent().expect("a directory above the profile");
+    let (target_dir, triple) = if above.join("CACHEDIR.TAG").exists() {
+        (above, None)
+    } else {
+        let root = above.parent().expect("a target directory above the triple");
+        (root, above.file_name().and_then(|n| n.to_str()))
+    };
+    let mut args = vec![
+        "--target-dir".to_owned(),
+        target_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(triple) = triple {
+        args.extend(["--target".to_owned(), triple.to_owned()]);
+    }
+    match profile_dir.file_name().and_then(|n| n.to_str()) {
+        Some("debug") | None => {}
+        Some("release") => args.push("--release".to_owned()),
+        Some(custom) => args.extend(["--profile".to_owned(), custom.to_owned()]),
+    }
+    (args, profile_dir.join("libpartitions.a"))
+}
+
+#[test]
+fn the_nested_build_follows_the_target_and_profile_of_the_test_binary() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let target = root.path().join("tgt");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let t = target.to_string_lossy().into_owned();
+    for (exe, args, archive) in [
+        (
+            target.join("debug/deps/c_abi-1"),
+            vec!["--target-dir", &t],
+            target.join("debug/libpartitions.a"),
+        ),
+        (
+            target.join("release/deps/c_abi-1"),
+            vec!["--target-dir", &t, "--release"],
+            target.join("release/libpartitions.a"),
+        ),
+        (
+            target.join("aarch64-unknown-linux-gnu/release/deps/c_abi-1"),
+            vec![
+                "--target-dir",
+                &t,
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--release",
+            ],
+            target.join("aarch64-unknown-linux-gnu/release/libpartitions.a"),
+        ),
+        (
+            target.join("x86_64-apple-darwin/ci-fast/deps/c_abi-1"),
+            vec![
+                "--target-dir",
+                &t,
+                "--target",
+                "x86_64-apple-darwin",
+                "--profile",
+                "ci-fast",
+            ],
+            target.join("x86_64-apple-darwin/ci-fast/libpartitions.a"),
+        ),
+    ] {
+        let (got_args, got_archive) = nested_build(&exe);
+        assert_eq!(got_args, args, "{exe:?}");
+        assert_eq!(got_archive, archive, "{exe:?}");
+    }
+}
+
 #[test]
 fn c_header_functions_link_against_the_built_library() {
     if cfg!(target_os = "windows") {
@@ -236,24 +325,16 @@ fn c_header_functions_link_against_the_built_library() {
         return;
     };
 
-    // This test binary lives in target/<profile>/deps; the archive the
-    // same `cargo test` built for `crate-type = ["staticlib", ...]` is
-    // one directory up.
-    let exe = std::env::current_exe().expect("test executable path");
-    let profile_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("target/<profile> above deps/");
-    let archive = profile_dir.join("libpartitions.a");
     // `cargo test` builds the library as an rlib for the tests and does
-    // not produce the staticlib, so build it here — every time, so the
-    // archive linked is this tree's and not a stale one left behind.
+    // not produce the staticlib, so build it here -- every time, so the
+    // archive linked is this tree's and not a stale one left behind -- into
+    // the same target directory, for the same target and profile, that
+    // built this test binary.
+    let exe = std::env::current_exe().expect("test executable path");
+    let (build_args, archive) = nested_build(&exe);
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let mut build = Command::new(&cargo);
-    build.args(["build", "--locked", "--lib"]);
-    if profile_dir.file_name().is_some_and(|n| n == "release") {
-        build.arg("--release");
-    }
+    build.args(["build", "--locked", "--lib"]).args(&build_args);
     let built = build
         .output()
         .unwrap_or_else(|e| panic!("failed to run {cargo}: {e}"));
