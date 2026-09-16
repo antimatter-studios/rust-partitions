@@ -299,8 +299,12 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
     if &sector[header_offsets::SIGNATURE..header_offsets::SIGNATURE + 8] != SIGNATURE {
         return Err(Error::GptCorrupt("missing EFI PART signature"));
     }
-    let header_size = u32::from_le_bytes(sector[12..16].try_into().unwrap());
-    if !(92..=512).contains(&header_size) {
+    let header_size = u32::from_le_bytes(
+        sector[header_offsets::HEADER_SIZE..header_offsets::HEADER_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if !(92..=SECTOR_SIZE as u32).contains(&header_size) {
         return Err(Error::GptCorrupt("header_size out of range"));
     }
 
@@ -315,6 +319,24 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
     let computed_header_crc = crc32fast::hash(&header_for_crc[..header_size as usize]);
     if computed_header_crc != stored_header_crc {
         return Err(Error::GptHeaderCrc);
+    }
+
+    // Inside the CRC'd region, so a restamped CRC does not vouch for it.
+    // A major revision other than 1 is a layout this parser has no
+    // reason to believe it knows; minor revisions extend the header
+    // through `header_size` and stay readable (#29).
+    //
+    // The reserved bytes 20..24 are deliberately NOT required to be zero,
+    // although the specification says they must be: `sgdisk -v` and the
+    // Linux kernel's GPT reader both accept a header with junk there, and
+    // refusing a table they read would make a disk unreadable here only.
+    let revision = u32::from_le_bytes(
+        sector[header_offsets::REVISION..header_offsets::REVISION + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if revision >> 16 != 1 {
+        return Err(Error::GptCorrupt("unsupported GPT header revision"));
     }
 
     let my_lba = u64::from_le_bytes(
@@ -332,8 +354,14 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
             .try_into()
             .unwrap(),
     );
-    let last_usable_lba = u64::from_le_bytes(sector[48..56].try_into().unwrap());
-    let disk_guid: [u8; 16] = sector[56..72].try_into().unwrap();
+    let last_usable_lba = u64::from_le_bytes(
+        sector[header_offsets::LAST_USABLE_LBA..header_offsets::LAST_USABLE_LBA + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let disk_guid: [u8; 16] = sector[header_offsets::DISK_GUID..header_offsets::DISK_GUID + 16]
+        .try_into()
+        .unwrap();
     let partition_entry_lba = u64::from_le_bytes(
         sector[header_offsets::PARTITION_ENTRY_LBA..header_offsets::PARTITION_ENTRY_LBA + 8]
             .try_into()
@@ -358,6 +386,15 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
 
     if !(128..=4096).contains(&partition_entry_size) {
         return Err(Error::GptCorrupt("partition_entry_size out of range"));
+    }
+    // The specification allows `128 * 2^n`. Any other size is accepted
+    // by nothing that writes tables, and walks the array at a stride no
+    // real table uses (#29).
+    if !partition_entry_size.is_multiple_of(128) || !(partition_entry_size / 128).is_power_of_two()
+    {
+        return Err(Error::GptCorrupt(
+            "partition_entry_size is not 128 times a power of two",
+        ));
     }
     if num_partition_entries > 4096 {
         return Err(Error::GptCorrupt("num_partition_entries > 4096"));
@@ -496,6 +533,13 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
 /// array. Validates header CRC and entry-array CRC.
 pub fn parse(dev: &dyn BlockRead, lba1: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Vec<Partition>> {
     let header = parse_header(lba1)?;
+    // The primary header says where it lives. A backup header copied
+    // over LBA 1 names the last LBA here, and its `partition_entry_lba`
+    // would send the parse to the backup array at the far end of the
+    // disk — the same check `parse_backup` makes for its own sector (#29).
+    if header.my_lba != 1 {
+        return Err(Error::GptCorrupt("primary header my_lba != 1"));
+    }
     let (parts, _) = parse_entry_array(dev, &header)?;
     Ok(parts)
 }
