@@ -14,6 +14,13 @@ never does.
   logical block. Such a disk was reported as a corrupt table instead of
   refused by its sector size. The check now reads the whole block and
   accepts a `header_size` up to it (#75).
+- **Two GPT entries sharing a UUID no longer trade entry tails on commit.**
+  `PartitionSet` keeps each wide entry's tail bytes keyed by UUID, so a
+  cloned table with a duplicate UUID kept one tail for both, and a commit
+  wrote it into both entries -- or, with one removed, gave the survivor
+  the other's. `from_probe` now refuses such a table with `GptCorrupt`
+  when the two tails differ; identical tails still round-trip, and
+  `probe` still reads the table (#81).
 - **A GPT image nested in an MBR disk no longer makes the disk "4Kn".**
   `probe` refused any disk whose byte 4096 parsed as a GPT header with
   `my_lba == 1`, which a disk image stored at LBA 7 of an ordinary MBR

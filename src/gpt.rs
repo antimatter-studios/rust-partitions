@@ -573,7 +573,8 @@ pub fn parse(dev: &dyn BlockRead, lba1: &[u8; crate::SECTOR_SIZE_USIZE]) -> Resu
 /// vendor bytes attached to somebody else's partition, and a removed
 /// partition's payload surviving its removal. A partition's UUID is
 /// what identifies it across a rewrite, so the tail travels with the
-/// partition wherever its slot goes.
+/// partition wherever its slot goes. A table where two entries share a
+/// UUID but not a tail has no such map, and [`entry_tails`] refuses it.
 ///
 /// Empty for a table whose `partition_entry_size` is the standard 128,
 /// where there is no tail to carry.
@@ -595,6 +596,22 @@ pub fn entry_tails(dev: &dyn BlockRead, header: &Header) -> Result<EntryTails> {
         let Some(slot) = p.slot else { continue };
         let off = (slot as usize) * entry_size;
         let tail = &array[off + ENTRY_STANDARD_BYTES..off + entry_size];
+        // TWO ENTRIES, ONE UUID (#81). Disk-cloning tools produce this.
+        // Keyed by UUID, the second tail used to replace the first, and a
+        // commit then wrote one entry's vendor bytes into the other -- or,
+        // with one of the pair removed, gave the survivor whichever tail
+        // won. Identical tails lose nothing and are kept; different ones
+        // cannot be told apart by the key a rewrite follows, so the set is
+        // refused here rather than any write guessing.
+        if let Some(kept) = out.get(&uuid) {
+            if kept.as_slice() != tail {
+                return Err(Error::GptCorrupt(
+                    "two entries share a unique partition GUID and carry different entry \
+                     tails, which a rewrite cannot keep apart",
+                ));
+            }
+            continue;
+        }
         out.insert(uuid, tail.to_vec());
     }
     Ok(out)
