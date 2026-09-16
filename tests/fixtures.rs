@@ -224,6 +224,107 @@ fn gpt_with_two_partitions() {
     }
 }
 
+/// Rewrite fields of the primary header at LBA 1 and restamp both CRCs,
+/// so the only thing wrong with the table is the field under test. A
+/// checksum is not a signature: anyone who can change a field can
+/// restamp it.
+fn restamp_primary_header(dev: &Bytes, edit: impl FnOnce(&mut [u8; 512])) {
+    let mut header = [0u8; 512];
+    dev.read_at(512, &mut header).unwrap();
+    edit(&mut header);
+    let entry_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let num = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let mut array = vec![0u8; num * size];
+    dev.read_at(entry_lba * 512, &mut array).unwrap();
+    header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    header[16..20].fill(0);
+    let crc = crc32fast::hash(&header[..header_size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write(512, &header);
+}
+
+/// `parse_header` checked the signature, the CRC and two size fields,
+/// and took the rest of what the specification constrains on trust. Each
+/// header below is one this crate's writer would never produce, with
+/// both CRCs valid, and each was returned as a working table (#29):
+///
+/// - a revision whose major is not 1 — a layout this parser has no
+///   reason to believe it knows;
+/// - a primary header whose `my_lba` is not 1. A backup header copied
+///   over LBA 1 is exactly this, and its `partition_entry_lba` then sent
+///   the parser to the backup array at the far end of the disk;
+/// - an entry size that is not 128 times a power of two, which walks the
+///   array at a stride no table uses.
+#[test]
+fn a_gpt_header_breaking_a_field_rule_is_refused_by_name() {
+    type Edit = fn(&mut [u8; 512]);
+    let cases: &[(&str, Edit, &str)] = &[
+        (
+            "revision 2.0",
+            |h| h[8..12].copy_from_slice(&0x0002_0000u32.to_le_bytes()),
+            "revision",
+        ),
+        (
+            "my_lba 33 on the primary",
+            |h| h[24..32].copy_from_slice(&33u64.to_le_bytes()),
+            "my_lba",
+        ),
+        (
+            "entry size 129",
+            |h| h[84..88].copy_from_slice(&129u32.to_le_bytes()),
+            "partition_entry_size",
+        ),
+        (
+            "entry size 136",
+            |h| h[84..88].copy_from_slice(&136u32.to_le_bytes()),
+            "partition_entry_size",
+        ),
+    ];
+    for (what, edit, names) in cases {
+        let dev = Bytes::new(8 * 1024 * 1024);
+        build_gpt_with_entries(
+            &dev,
+            &[(type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "a")],
+        );
+        restamp_primary_header(&dev, *edit);
+        match probe(&dev) {
+            Err(Error::GptCorrupt(msg)) if msg.contains(names) => {}
+            other => panic!("{what}: expected GptCorrupt naming {names:?}, got {other:?}"),
+        }
+    }
+
+    // The controls: the same restamping with legal values still parses.
+    type Legal = fn(&mut [u8; 512]);
+    let legal: &[(&str, Legal)] = &[
+        ("unchanged", |_| {}),
+        // The specification says zero; sgdisk -v and Linux accept junk,
+        // so this reader does too.
+        ("reserved non-zero", |h| {
+            h[20..24].copy_from_slice(&[1, 0, 0, 0])
+        }),
+        ("revision 1.1", |h| {
+            h[8..12].copy_from_slice(&0x0001_0001u32.to_le_bytes())
+        }),
+        ("entry size 256", |h| {
+            h[84..88].copy_from_slice(&256u32.to_le_bytes())
+        }),
+    ];
+    for (what, edit) in legal {
+        let dev = Bytes::new(8 * 1024 * 1024);
+        build_gpt_with_entries(
+            &dev,
+            &[(type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "a")],
+        );
+        restamp_primary_header(&dev, *edit);
+        match probe(&dev) {
+            Ok((TableKind::Gpt, parts)) if !parts.is_empty() => {}
+            other => panic!("{what}: a legal header must parse, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn gpt_header_crc_mismatch() {
     let dev = Bytes::new(8 * 1024 * 1024);
@@ -1373,6 +1474,44 @@ fn build_gpt_4kn(dev: &Bytes, my_lba: u64, repair_crc: bool) {
     dev.write(BS as usize, &header);
 }
 
+/// A disk image nested inside an ordinary MBR disk is not a 4Kn disk.
+///
+/// The 4Kn test asked only whether byte 4096 parses as a GPT header with
+/// `my_lba == 1`. A GPT image stored at LBA 7 of an MBR disk puts its
+/// own LBA 1 exactly there, genuine CRC and all, so the outer disk was
+/// refused as `UnsupportedSectorSize` and its real partitions were
+/// unreachable (#68). A 4Kn GPT disk also carries a protective MBR in
+/// its first 512 bytes; this one carries an ordinary MBR.
+#[test]
+fn a_gpt_image_nested_at_byte_3584_of_an_mbr_disk_is_not_taken_for_4kn() {
+    let inner = Bytes::new(4 * 1024 * 1024);
+    build_gpt_with_entries(
+        &inner,
+        &[(type_guids::LINUX_FILESYSTEM, [9u8; 16], 2048, 4095, "inner")],
+    );
+    let outer = Bytes::new(16 * 1024 * 1024);
+    outer.write(3584, &inner.0.lock().unwrap());
+    // The outer disk's own MBR, written after the copy (which starts
+    // past LBA 0 anyway).
+    write_mbr_entry(&outer, 0, 0x83, 16384, 8192);
+    outer.write(510, &[0x55, 0xAA]);
+
+    let mut at_4096 = [0u8; 8];
+    outer.read_at(4096, &mut at_4096).unwrap();
+    assert_eq!(
+        &at_4096, b"EFI PART",
+        "fixture: the nested header sits at byte 4096"
+    );
+
+    match probe(&outer) {
+        Ok((TableKind::Mbr, parts)) => {
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].start, 16384 * 512);
+        }
+        other => panic!("an MBR disk holding a nested GPT image gave {other:?}"),
+    }
+}
+
 /// A healthy 4Kn GPT disk is refused by name, not reported as corrupt.
 ///
 /// Before this it came back as
@@ -1391,6 +1530,28 @@ fn a_4kn_gpt_disk_is_refused_by_its_sector_size() {
             );
         }
         other => panic!("expected UnsupportedSectorSize, got {other:?}"),
+    }
+}
+
+/// A 4Kn GPT disk with a HYBRID MBR is still refused by its sector size.
+///
+/// The gate that stops a nested image's header being taken for 4Kn (#68)
+/// first required a protective MBR, which is one `0xEE` entry alone. A
+/// hybrid carries mirrored entries beside the marker, so this disk fell
+/// through to the MBR branch and its LBAs were read as 512-byte sectors
+/// -- offsets eight times too small, silently, where it had been refused.
+/// Found by Greptile on #108.
+#[test]
+fn a_4kn_gpt_disk_with_a_hybrid_mbr_is_still_refused_by_its_sector_size() {
+    let dev = Bytes::new(64 * 1024 * 1024);
+    build_gpt_4kn(&dev, 1, true);
+    // A mirrored real partition in slot 1, beside the marker in slot 0.
+    dev.write(446 + 16 + 4, &[0x83]);
+    dev.write_u32_le(446 + 16 + 8, 256);
+    dev.write_u32_le(446 + 16 + 12, 256);
+    match probe(&dev) {
+        Err(Error::UnsupportedSectorSize(msg)) => assert!(msg.contains("4096"), "{msg}"),
+        other => panic!("a 4Kn hybrid was not refused by its sector size: {other:?}"),
     }
 }
 

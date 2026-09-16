@@ -125,6 +125,15 @@ pub fn is_protective(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> bool {
     nonempty == 1 && all_protective
 }
 
+/// True when any entry is a `0xEE` GPT marker: a protective MBR, or a
+/// hybrid one that also mirrors real partitions. Unlike [`is_protective`],
+/// which requires the marker alone, this is what says "this disk's real
+/// table is a GPT" on both.
+pub fn has_gpt_marker(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> bool {
+    (0..layout::ENTRY_COUNT)
+        .any(|i| lba0[layout::entry_at(i) + layout::TYPE_BYTE] == TYPE_GPT_PROTECTIVE)
+}
+
 /// MBR active/boot flag mask. The "status byte" at offset +0 of each entry
 /// holds this in its high bit; legacy BIOS firmware boots from the partition
 /// where this bit is set.

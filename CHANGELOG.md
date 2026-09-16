@@ -14,6 +14,13 @@ never does.
   partition over it and `commit` returned `Ok(())`. `ReservedEntry::span`
   gives each preserved entry's range -- none for a `0xEE` marker, by type,
   or an entry with no sectors -- and all four now respect it (#67).
+- **A GPT image nested in an MBR disk no longer makes the disk "4Kn".**
+  `probe` refused any disk whose byte 4096 parsed as a GPT header with
+  `my_lba == 1`, which a disk image stored at LBA 7 of an ordinary MBR
+  disk provides, so the outer disk's partitions were unreachable behind
+  `UnsupportedSectorSize`. The 4Kn check now runs only when LBA 0
+  carries a `0xEE` GPT marker, alone or in a hybrid, so a 4Kn hybrid is
+  still refused by name (#68).
 - **`slot` is documented as zero-based.** `Partition::slot`,
   `PartitionInfo.slot` and `include/partitions.h` said the slot *was* the
   `3` in `/dev/sda3`, while the value is the entry's zero-based position
@@ -41,6 +48,14 @@ never does.
   before aligning. The behaviour is unchanged and now pinned by tests;
   `add`'s "hinted start before first usable LBA" refusal, which tested
   the already-raised value and could not fire, is removed (#42, #26).
+- **`probe` refuses GPT headers the specification forbids.** A primary
+  header whose `my_lba` is not 1 — a backup header copied over LBA 1,
+  whose entry-array pointer sent the parse to the far end of the disk —
+  a major revision other than 1, and a `partition_entry_size` that is not
+  128 times a power of two were all accepted with valid CRCs. Each is now
+  `GptCorrupt` naming the field, matching what `sgdisk -v` reports; the
+  writer refuses such an entry size too. Non-zero reserved bytes are
+  still accepted, as `sgdisk` and Linux accept them (#29).
 - **A Linux extended container (`0x85`) is no longer reported as a
   volume.** `mbr::entry_role` knew only `0x05` and `0x0F`, so `probe`
   returned a `0x85` container beside the real partitions: sniffing it
