@@ -35,6 +35,14 @@ never does.
   before aligning. The behaviour is unchanged and now pinned by tests;
   `add`'s "hinted start before first usable LBA" refusal, which tested
   the already-raised value and could not fire, is removed (#42, #26).
+- **`probe` refuses GPT headers the specification forbids.** A primary
+  header whose `my_lba` is not 1 — a backup header copied over LBA 1,
+  whose entry-array pointer sent the parse to the far end of the disk —
+  a major revision other than 1, and a `partition_entry_size` that is not
+  128 times a power of two were all accepted with valid CRCs. Each is now
+  `GptCorrupt` naming the field, matching what `sgdisk -v` reports; the
+  writer refuses such an entry size too. Non-zero reserved bytes are
+  still accepted, as `sgdisk` and Linux accept them (#29).
 - **A Linux extended container (`0x85`) is no longer reported as a
   volume.** `mbr::entry_role` knew only `0x05` and `0x0F`, so `probe`
   returned a `0x85` container beside the real partitions: sniffing it
