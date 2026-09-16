@@ -224,6 +224,107 @@ fn gpt_with_two_partitions() {
     }
 }
 
+/// Rewrite fields of the primary header at LBA 1 and restamp both CRCs,
+/// so the only thing wrong with the table is the field under test. A
+/// checksum is not a signature: anyone who can change a field can
+/// restamp it.
+fn restamp_primary_header(dev: &Bytes, edit: impl FnOnce(&mut [u8; 512])) {
+    let mut header = [0u8; 512];
+    dev.read_at(512, &mut header).unwrap();
+    edit(&mut header);
+    let entry_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let num = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let mut array = vec![0u8; num * size];
+    dev.read_at(entry_lba * 512, &mut array).unwrap();
+    header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    header[16..20].fill(0);
+    let crc = crc32fast::hash(&header[..header_size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write(512, &header);
+}
+
+/// `parse_header` checked the signature, the CRC and two size fields,
+/// and took the rest of what the specification constrains on trust. Each
+/// header below is one this crate's writer would never produce, with
+/// both CRCs valid, and each was returned as a working table (#29):
+///
+/// - a revision whose major is not 1 — a layout this parser has no
+///   reason to believe it knows;
+/// - a primary header whose `my_lba` is not 1. A backup header copied
+///   over LBA 1 is exactly this, and its `partition_entry_lba` then sent
+///   the parser to the backup array at the far end of the disk;
+/// - an entry size that is not 128 times a power of two, which walks the
+///   array at a stride no table uses.
+#[test]
+fn a_gpt_header_breaking_a_field_rule_is_refused_by_name() {
+    type Edit = fn(&mut [u8; 512]);
+    let cases: &[(&str, Edit, &str)] = &[
+        (
+            "revision 2.0",
+            |h| h[8..12].copy_from_slice(&0x0002_0000u32.to_le_bytes()),
+            "revision",
+        ),
+        (
+            "my_lba 33 on the primary",
+            |h| h[24..32].copy_from_slice(&33u64.to_le_bytes()),
+            "my_lba",
+        ),
+        (
+            "entry size 129",
+            |h| h[84..88].copy_from_slice(&129u32.to_le_bytes()),
+            "partition_entry_size",
+        ),
+        (
+            "entry size 136",
+            |h| h[84..88].copy_from_slice(&136u32.to_le_bytes()),
+            "partition_entry_size",
+        ),
+    ];
+    for (what, edit, names) in cases {
+        let dev = Bytes::new(8 * 1024 * 1024);
+        build_gpt_with_entries(
+            &dev,
+            &[(type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "a")],
+        );
+        restamp_primary_header(&dev, *edit);
+        match probe(&dev) {
+            Err(Error::GptCorrupt(msg)) if msg.contains(names) => {}
+            other => panic!("{what}: expected GptCorrupt naming {names:?}, got {other:?}"),
+        }
+    }
+
+    // The controls: the same restamping with legal values still parses.
+    type Legal = fn(&mut [u8; 512]);
+    let legal: &[(&str, Legal)] = &[
+        ("unchanged", |_| {}),
+        // The specification says zero; sgdisk -v and Linux accept junk,
+        // so this reader does too.
+        ("reserved non-zero", |h| {
+            h[20..24].copy_from_slice(&[1, 0, 0, 0])
+        }),
+        ("revision 1.1", |h| {
+            h[8..12].copy_from_slice(&0x0001_0001u32.to_le_bytes())
+        }),
+        ("entry size 256", |h| {
+            h[84..88].copy_from_slice(&256u32.to_le_bytes())
+        }),
+    ];
+    for (what, edit) in legal {
+        let dev = Bytes::new(8 * 1024 * 1024);
+        build_gpt_with_entries(
+            &dev,
+            &[(type_guids::LINUX_FILESYSTEM, [1u8; 16], 2048, 4095, "a")],
+        );
+        restamp_primary_header(&dev, *edit);
+        match probe(&dev) {
+            Ok((TableKind::Gpt, parts)) if !parts.is_empty() => {}
+            other => panic!("{what}: a legal header must parse, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn gpt_header_crc_mismatch() {
     let dev = Bytes::new(8 * 1024 * 1024);
