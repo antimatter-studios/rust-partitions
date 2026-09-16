@@ -8,6 +8,13 @@ never does.
 
 ### Fixed
 
+- **A Linux extended container (`0x85`) is no longer reported as a
+  volume.** `mbr::entry_role` knew only `0x05` and `0x0F`, so `probe`
+  returned a `0x85` container beside the real partitions: sniffing it
+  read an EBR, and `partitions_open_slice` handed a driver the chain.
+  It is now a container, preserved through `reserved_entries` with its
+  original bytes like the other two, and `mbr::types::LINUX_EXTENDED`
+  names it (#70).
 - **`PartitionSet::add(None, ..)` finds space on a disk with a nested
   partition.** `find_free` walks partitions sorted by start and moved its
   cursor to each one's end, so a partition nested inside another dragged

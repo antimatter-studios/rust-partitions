@@ -508,9 +508,13 @@ fn a_partition_reaching_past_the_device_is_still_reported() {
 /// container as if it were one of them": sniffing it reads an EBR and
 /// calls it an unknown filesystem, and slicing it hands a driver the
 /// chain.
+///
+/// `0x85` is the Linux extended container, the third type the Linux
+/// kernel's msdos parser and libfdisk walk as a chain; it was missing and
+/// came back as a volume (#70).
 #[test]
 fn an_extended_container_is_not_reported_as_a_volume() {
-    for container in [0x05u8, 0x0F] {
+    for container in [0x05u8, 0x0F, 0x85] {
         let dev = Bytes::new(16 * 1024 * 1024);
         write_mbr_entry(&dev, 0, 0x83, 2048, 2048); // a real partition
         write_mbr_entry(&dev, 1, container, 8192, 16384); // the container
