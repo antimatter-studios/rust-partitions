@@ -8,6 +8,13 @@ never does.
 
 ### Fixed
 
+- **Two GPT entries sharing a UUID no longer trade entry tails on commit.**
+  `PartitionSet` keeps each wide entry's tail bytes keyed by UUID, so a
+  cloned table with a duplicate UUID kept one tail for both, and a commit
+  wrote it into both entries -- or, with one removed, gave the survivor
+  the other's. `from_probe` now refuses such a table with `GptCorrupt`
+  when the two tails differ; identical tails still round-trip, and
+  `probe` still reads the table (#81).
 - **`slot` is documented as zero-based.** `Partition::slot`,
   `PartitionInfo.slot` and `include/partitions.h` said the slot *was* the
   `3` in `/dev/sda3`, while the value is the entry's zero-based position
