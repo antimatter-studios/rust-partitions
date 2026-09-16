@@ -322,6 +322,7 @@ impl PartitionSet {
     pub fn remove(&mut self, target: PartitionRef) -> Result<()> {
         let idx = self.resolve(target)?;
         self.partitions.remove(idx);
+        self.refresh_overlap_issues();
         Ok(())
     }
 
@@ -359,6 +360,11 @@ impl PartitionSet {
             }
         }
         self.partitions[idx].length = new_length_sectors * SECTOR_SIZE;
+        // The new end was just checked against the last usable LBA and
+        // the start is unchanged, so the only range rule the resize can
+        // have settled is the one about running past the end.
+        self.partitions[idx].issues &= !gpt::entry_issue::PAST_LAST_USABLE;
+        self.refresh_overlap_issues();
         Ok(())
     }
 
@@ -384,6 +390,39 @@ impl PartitionSet {
     }
 
     // --- helpers -----------------------------------------------------------
+
+    /// Re-derive every GPT entry's `OVERLAPS_ANOTHER` bit from the set as
+    /// it now stands.
+    ///
+    /// `issues` is what `probe` found, and an edit can settle a rule it
+    /// reported: without this, the survivor of an overlapping pair kept
+    /// the flag after its partner was removed (#73). Only the overlap bit
+    /// is a property of the set; the range bits belong to each entry and
+    /// are settled where that entry changes.
+    ///
+    /// MBR entries never carry issues, so they are left alone. An entry
+    /// whose span cannot be computed keeps whatever bit it had rather
+    /// than being judged on a range that does not exist.
+    fn refresh_overlap_issues(&mut self) {
+        if self.table_kind != TableKind::Gpt {
+            return;
+        }
+        let spans: Vec<(usize, (u64, u64))> = self
+            .partitions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.sector_span().ok().map(|span| (i, span)))
+            .collect();
+        let only_spans: Vec<(u64, u64)> = spans.iter().map(|&(_, span)| span).collect();
+        for (&(i, _), overlaps) in spans.iter().zip(gpt::mark_overlaps(&only_spans)) {
+            let issues = &mut self.partitions[i].issues;
+            if overlaps {
+                *issues |= gpt::entry_issue::OVERLAPS_ANOTHER;
+            } else {
+                *issues &= !gpt::entry_issue::OVERLAPS_ANOTHER;
+            }
+        }
+    }
 
     fn usable_range(&self) -> (u64, u64) {
         let total_sectors = self.disk_size / SECTOR_SIZE;

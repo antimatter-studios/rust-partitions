@@ -8,6 +8,13 @@ never does.
 
 ### Fixed
 
+- **`Partition::issues` follows `remove` and `resize` on a GPT set.**
+  The flags were computed once by `probe`, so removing one of an
+  overlapping pair left the survivor reporting `OVERLAPS_ANOTHER`, and
+  shrinking an entry back inside the usable range left
+  `PAST_LAST_USABLE` set. The overlap bit is now re-derived from the set
+  after either edit, and a successful resize clears `PAST_LAST_USABLE`
+  on the entry it changed. MBR entries still carry no issues (#73).
 - **`PartitionSet::add` and `resize` document the rounding they do.**
   Both round a length up to the next 1 MiB, not the next sector as their
   docs said (`add(None, 4096)` gives 1 MiB; `resize` to 512 bytes gives
