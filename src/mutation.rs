@@ -198,9 +198,17 @@ impl PartitionSet {
     }
 
     /// Add a partition. `start_hint = None` triggers a first-fit search at
-    /// 1 MiB alignment. A non-`None` hint that isn't already aligned is
-    /// rounded up to the next 1 MiB boundary, and `length` is rounded up to
-    /// the next sector if it isn't already a multiple of 512.
+    /// 1 MiB alignment.
+    ///
+    /// A non-`None` hint below the table's first usable LBA is raised to
+    /// it, and the result is then rounded up to the next 1 MiB boundary —
+    /// so on an ordinary disk a hint of `0` places the partition at 1 MiB
+    /// rather than being refused.
+    ///
+    /// `length` is rounded up to the next **1 MiB** multiple, not the next
+    /// sector: asking for 4096 bytes gives a 1 MiB partition, and asking
+    /// for 1 MiB + 1 byte gives 2 MiB. Read the placed start and length
+    /// back from `self.partitions[index]`.
     ///
     /// Returns the index of the newly added partition.
     pub fn add(
@@ -242,12 +250,11 @@ impl PartitionSet {
 
         let start_lba = match start_hint {
             Some(byte) => {
+                // Raised to the first usable LBA, then aligned. `align_up`
+                // never decreases, so the result is never below the usable
+                // range; a refusal that tested for it could not fire (#26).
                 let raw_sectors = byte.div_ceil(SECTOR_SIZE);
-                let aligned = align_up(raw_sectors.max(first_usable_lba), ALIGNMENT_SECTORS);
-                if aligned < first_usable_lba {
-                    return Err(Error::Invalid("hinted start before first usable LBA"));
-                }
-                aligned
+                align_up(raw_sectors.max(first_usable_lba), ALIGNMENT_SECTORS)
             }
             None => self.find_free(length_sectors, first_usable_lba, last_usable_lba)?,
         };
@@ -318,8 +325,10 @@ impl PartitionSet {
         Ok(())
     }
 
-    /// Resize a partition. The new length is rounded up to a sector multiple
-    /// and re-validated against the device bounds and other partitions.
+    /// Resize a partition. The new length is rounded up to the next **1 MiB**
+    /// multiple, not the next sector — a resize to 512 bytes gives a 1 MiB
+    /// partition — and re-validated against the device bounds and other
+    /// partitions. Read the applied length back from `self.partitions`.
     pub fn resize(&mut self, target: PartitionRef, new_length: u64) -> Result<()> {
         if new_length == 0 {
             return Err(Error::Invalid("zero length"));

@@ -8,6 +8,13 @@ never does.
 
 ### Fixed
 
+- **`PartitionSet::add` and `resize` document the rounding they do.**
+  Both round a length up to the next 1 MiB, not the next sector as their
+  docs said (`add(None, 4096)` gives 1 MiB; `resize` to 512 bytes gives
+  1 MiB), and `add` raises a start hint below the first usable LBA to it
+  before aligning. The behaviour is unchanged and now pinned by tests;
+  `add`'s "hinted start before first usable LBA" refusal, which tested
+  the already-raised value and could not fire, is removed (#42, #26).
 - **A Linux extended container (`0x85`) is no longer reported as a
   volume.** `mbr::entry_role` knew only `0x05` and `0x0F`, so `probe`
   returned a `0x85` container beside the real partitions: sniffing it
