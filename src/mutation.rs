@@ -433,8 +433,11 @@ impl PartitionSet {
                     return Ok(cursor);
                 }
             }
-            // Move cursor past this partition, re-aligned.
-            cursor = align_up(p_end + 1, ALIGNMENT_SECTORS);
+            // Move cursor past this partition, re-aligned — and never
+            // back. Sorted by start is not sorted by end: a partition
+            // nested inside the previous one ends first, and following
+            // its end would put the cursor inside the outer one (#27).
+            cursor = cursor.max(align_up(p_end + 1, ALIGNMENT_SECTORS));
         }
         if cursor.saturating_add(length_sectors).saturating_sub(1) <= last_usable {
             Ok(cursor)

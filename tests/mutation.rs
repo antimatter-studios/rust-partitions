@@ -1771,3 +1771,39 @@ fn wide_entry_table(dev: &MemDev, count: usize) -> Vec<[u8; 16]> {
     write_gpt_with_geometry(dev, &parts, [0x11u8; 16], geometry).expect("a 256-byte table");
     uuids
 }
+
+/// `find_free` walks partitions sorted by start and set its cursor to
+/// each one's end unconditionally. Sorted by start is not sorted by end:
+/// a partition nested inside another is visited second and ends first,
+/// so the cursor was dragged back inside the outer partition and
+/// `find_free` answered a sector the outer one occupies. `add`'s own
+/// overlap check then refused it, so `add(None, ..)` could not place a
+/// partition anywhere on such a disk — the damaged table `probe` keeps
+/// editable on purpose, reporting both entries `OVERLAPS_ANOTHER`. #27.
+#[test]
+fn find_free_does_not_move_its_cursor_back_over_a_nested_partition() {
+    let nested = |first: u64, last: u64, uuid: u8| Partition {
+        start: first * 512,
+        length: (last - first + 1) * 512,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: None,
+        uuid: Some([uuid; 16]),
+        slot: None,
+        issues: 0,
+    };
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.partitions.push(nested(2048, 10239, 1));
+    set.partitions.push(nested(4096, 6143, 2));
+
+    let idx = set
+        .add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .expect("59 MiB are free above the outer partition");
+    assert_eq!(
+        set.partitions[idx].start,
+        10240 * 512,
+        "first fit is the first aligned sector past the outer partition"
+    );
+}
