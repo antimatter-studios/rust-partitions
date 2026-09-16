@@ -142,8 +142,11 @@ fn target_c_compiler(triple: &str) -> Option<String> {
 }
 
 /// Whether a compiler whose `-dumpmachine` is `machine` builds for the Rust
-/// target `triple`: same architecture (Apple spells aarch64 `arm64`) and
-/// same system.
+/// target `triple`: same architecture (Apple spells aarch64 `arm64`), same
+/// system, and on Linux the same C library and ABI. A glibc compiler does
+/// not link a `-musl` static library, so `x86_64-linux-gnu` is not a
+/// compiler for `x86_64-unknown-linux-musl`. A Linux `-dumpmachine` that
+/// names no environment (`x86_64-redhat-linux`) is a glibc one.
 fn compiler_builds_for(machine: &str, triple: &str) -> bool {
     let arch = |t: &str| match t.split('-').next().unwrap_or("") {
         "arm64" => "aarch64".to_owned(),
@@ -154,7 +157,17 @@ fn compiler_builds_for(machine: &str, triple: &str) -> bool {
             .into_iter()
             .find(|os| t.contains(os))
     };
-    !machine.is_empty() && arch(machine) == arch(triple) && system(machine) == system(triple)
+    let environment = |t: &str| match t.split_once("linux") {
+        Some((_, rest)) => match rest.trim_start_matches('-') {
+            "" => "gnu".to_owned(),
+            env => env.to_owned(),
+        },
+        None => String::new(),
+    };
+    !machine.is_empty()
+        && arch(machine) == arch(triple)
+        && system(machine) == system(triple)
+        && environment(machine) == environment(triple)
 }
 
 #[test]
@@ -167,6 +180,24 @@ fn a_host_compiler_is_used_for_a_target_only_when_it_builds_for_it() {
         ("aarch64-linux-gnu", "aarch64-apple-darwin", false),
         ("arm64-apple-darwin23.4.0", "x86_64-apple-darwin", false),
         ("", "x86_64-unknown-linux-gnu", false),
+        // The C library and ABI are part of the target (Greptile on #111).
+        ("x86_64-linux-gnu", "x86_64-unknown-linux-musl", false),
+        (
+            "x86_64-alpine-linux-musl",
+            "x86_64-unknown-linux-gnu",
+            false,
+        ),
+        (
+            "x86_64-alpine-linux-musl",
+            "x86_64-unknown-linux-musl",
+            true,
+        ),
+        (
+            "aarch64-linux-gnu",
+            "aarch64-unknown-linux-gnu_ilp32",
+            false,
+        ),
+        ("x86_64-redhat-linux", "x86_64-unknown-linux-gnu", true),
     ] {
         assert_eq!(
             compiler_builds_for(machine, triple),
