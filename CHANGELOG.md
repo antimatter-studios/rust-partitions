@@ -8,6 +8,13 @@ never does.
 
 ### Fixed
 
+- **`PartitionSet::add(None, ..)` finds space on a disk with a nested
+  partition.** `find_free` walks partitions sorted by start and moved its
+  cursor to each one's end, so a partition nested inside another dragged
+  the cursor back inside the outer one; `add` then refused its own answer
+  as an overlap, whatever the size asked for. Such a table is what
+  `probe` keeps editable on purpose. The cursor now only moves forward
+  (#27).
 - **`sniff` refuses a partition starting at or past the end of the
   device before sizing its window.** It relied on the read to fail, and
   a zero-length read is `Ok` at any offset on a real `FileDevice`, so a
