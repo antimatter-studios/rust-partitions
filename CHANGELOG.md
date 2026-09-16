@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A 4Kn GPT header larger than 512 bytes is still recognised as 4Kn.**
+  The 4Kn check read a 512-byte sector at byte 4096 and `parse_header`
+  capped `header_size` at 512, while a header may fill its 4096-byte
+  logical block. Such a disk was reported as a corrupt table instead of
+  refused by its sector size. The check now reads the whole block and
+  accepts a `header_size` up to it (#75).
 - **A GPT image nested in an MBR disk no longer makes the disk "4Kn".**
   `probe` refused any disk whose byte 4096 parsed as a GPT header with
   `my_lba == 1`, which a disk image stored at LBA 7 of an ordinary MBR

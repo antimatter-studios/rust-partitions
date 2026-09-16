@@ -1436,6 +1436,11 @@ fn an_entry_starting_past_the_disk_is_reported() {
 /// Lay down a GPT in 4096-byte LBAs. `my_lba` and the header CRC are
 /// parameters so the detection's individual conditions can be pinned.
 fn build_gpt_4kn(dev: &Bytes, my_lba: u64, repair_crc: bool) {
+    build_gpt_4kn_sized(dev, my_lba, repair_crc, 92);
+}
+
+/// [`build_gpt_4kn`] with a chosen `header_size`.
+fn build_gpt_4kn_sized(dev: &Bytes, my_lba: u64, repair_crc: bool, header_size: u32) {
     const BS: u64 = 4096;
     let total_lbas = dev.size_bytes() / BS;
 
@@ -1457,7 +1462,7 @@ fn build_gpt_4kn(dev: &Bytes, my_lba: u64, repair_crc: bool) {
     let mut header = vec![0u8; BS as usize];
     header[0..8].copy_from_slice(b"EFI PART");
     header[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
-    header[12..16].copy_from_slice(&92u32.to_le_bytes());
+    header[12..16].copy_from_slice(&header_size.to_le_bytes());
     header[24..32].copy_from_slice(&my_lba.to_le_bytes());
     header[32..40].copy_from_slice(&(total_lbas - 1).to_le_bytes());
     header[40..48].copy_from_slice(&34u64.to_le_bytes());
@@ -1468,7 +1473,7 @@ fn build_gpt_4kn(dev: &Bytes, my_lba: u64, repair_crc: bool) {
     header[84..88].copy_from_slice(&entry_size.to_le_bytes());
     header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
     if repair_crc {
-        let hc = crc32fast::hash(&header[..92]);
+        let hc = crc32fast::hash(&header[..(header_size as usize).min(BS as usize)]);
         header[16..20].copy_from_slice(&hc.to_le_bytes());
     }
     dev.write(BS as usize, &header);
@@ -1531,6 +1536,29 @@ fn a_4kn_gpt_disk_is_refused_by_its_sector_size() {
         }
         other => panic!("expected UnsupportedSectorSize, got {other:?}"),
     }
+}
+
+/// A 4Kn header may be larger than 512 bytes, up to its 4096-byte block,
+/// and is still recognised as 4Kn rather than reported corrupt (#75).
+#[test]
+fn a_4kn_gpt_disk_with_a_header_larger_than_512_bytes_is_refused_by_its_sector_size() {
+    for header_size in [513u32, 1024, 4096] {
+        let dev = Bytes::new(64 * 1024 * 1024);
+        build_gpt_4kn_sized(&dev, 1, true, header_size);
+        match probe(&dev) {
+            Err(Error::UnsupportedSectorSize(msg)) => assert!(msg.contains("4096"), "{msg}"),
+            other => {
+                panic!("header_size {header_size}: expected UnsupportedSectorSize, got {other:?}")
+            }
+        }
+    }
+    // Past the block is still out of range.
+    let dev = Bytes::new(64 * 1024 * 1024);
+    build_gpt_4kn_sized(&dev, 1, true, 4097);
+    assert!(
+        !matches!(probe(&dev), Err(Error::UnsupportedSectorSize(_))),
+        "a header_size past its block is not a 4Kn header"
+    );
 }
 
 /// A 4Kn GPT disk with a HYBRID MBR is still refused by its sector size.

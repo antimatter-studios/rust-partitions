@@ -174,9 +174,11 @@ const FOUR_K_LBA1: u64 = 4096;
 /// Returns the message rather than a bool so the reason travels with
 /// the refusal.
 fn looks_like_4kn_gpt(dev: &dyn BlockRead) -> Option<&'static str> {
-    let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
-    dev.read_at(FOUR_K_LBA1, &mut sector).ok()?;
-    let header = gpt::parse_header(&sector).ok()?;
+    // The whole 4096-byte LBA, not a 512-byte sector of it: a header there
+    // may declare a `header_size` up to its block (#75).
+    let mut block = [0u8; 4096];
+    dev.read_at(FOUR_K_LBA1, &mut block).ok()?;
+    let header = gpt::parse_header_block(&block).ok()?;
     if header.my_lba != 1 {
         return None;
     }
