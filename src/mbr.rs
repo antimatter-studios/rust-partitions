@@ -323,6 +323,16 @@ pub fn write_mbr_preserving(
     partitions: &[Partition],
     reserved: &[ReservedEntry],
 ) -> Result<()> {
+    write_mbr_assigning_slots(dev, partitions, reserved).map(|_| ())
+}
+
+/// As [`write_mbr_preserving`], returning the table slot each partition
+/// was written into, in `partitions` order.
+pub(crate) fn write_mbr_assigning_slots(
+    dev: &dyn BlockDevice,
+    partitions: &[Partition],
+    reserved: &[ReservedEntry],
+) -> Result<Vec<u32>> {
     if !dev.is_writable() {
         return Err(Error::Block(fs_core::Error::ReadOnly));
     }
@@ -383,7 +393,7 @@ pub fn write_mbr_preserving(
     sector[510] = 0x55;
     sector[511] = 0xAA;
     dev.write_at(0, &sector)?;
-    Ok(())
+    Ok(slots)
 }
 
 fn validate_mbr_partition(p: &Partition, total_bytes: u64) -> Result<()> {

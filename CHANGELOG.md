@@ -14,6 +14,13 @@ never does.
   in the table, one lower. The value is unchanged; the docs now say the
   system's number is `slot + 1`, and a test pins slots 0 and 1 for the
   first two partitions written on both table types (#57).
+- **`PartitionSet::commit_mut` records the slots a commit assigned.**
+  `commit` takes `&self`, so a partition given the lowest free slot on
+  disk still said `slot: None` in the set; after removing a partition in
+  a lower slot, committing again moved it — slot 2 became slot 0 with
+  nothing about it changed. `commit_mut` writes, flushes, and only then
+  stores each partition's slot. `commit` is unchanged and documents the
+  hazard (#69).
 - **`Partition::issues` follows `remove` and `resize` on a GPT set.**
   The flags were computed once by `probe`, so removing one of an
   overlapping pair left the survivor reporting `OVERLAPS_ANOTHER`, and

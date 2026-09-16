@@ -295,6 +295,19 @@ pub fn write_gpt_preserving_tails(
     geometry: GptGeometry,
     tails: &gpt::EntryTails,
 ) -> Result<()> {
+    write_gpt_assigning_slots(dev, partitions, disk_guid, geometry, tails).map(|_| ())
+}
+
+/// As [`write_gpt_preserving_tails`], returning the table slot each
+/// partition was written into, in `partitions` order — the slots
+/// [`assign_slots`] gave them, not a second derivation of them.
+pub(crate) fn write_gpt_assigning_slots(
+    dev: &dyn BlockDevice,
+    partitions: &[Partition],
+    disk_guid: [u8; 16],
+    geometry: GptGeometry,
+    tails: &gpt::EntryTails,
+) -> Result<Vec<u32>> {
     if !dev.is_writable() {
         return Err(Error::Block(fs_core::Error::ReadOnly));
     }
@@ -442,7 +455,7 @@ pub fn write_gpt_preserving_tails(
     );
     dev.write_at(last_lba * SECTOR_SIZE, &backup)?;
 
-    Ok(())
+    Ok(slots)
 }
 
 /// Which table slot each partition is written into.
