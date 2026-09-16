@@ -2080,3 +2080,97 @@ fn a_protective_marker_or_an_empty_entry_does_not_block_a_new_partition() {
     assert_eq!(set.partitions[idx].start, 2048 * 512);
     set.commit(&dev).unwrap();
 }
+
+/// Tails are keyed by UUID, so two entries sharing one -- which a disk
+/// cloning tool produces -- collapsed to a single tail on probe, and the
+/// commit wrote that one tail into both entries: the other partition's
+/// vendor bytes were replaced with somebody else's and the commit said
+/// `Ok` (#81). No key a rewrite follows can tell the two tails apart, so
+/// building an editable set from such a table is refused, before anything
+/// can be written.
+#[test]
+fn a_wide_table_with_two_entries_sharing_a_uuid_is_not_committed_over_their_tails() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let uuids = wide_entry_table(&dev, 2);
+    plant_entry_tail(&dev, 0, b"TAIL-OF-ZERO");
+    plant_entry_tail(&dev, 1, b"TAIL-OF-ONE!");
+    plant_entry_uuid(&dev, 1, uuids[0]);
+
+    let before = gpt_entry_array(&dev);
+    let (_, parts) = probe(&dev).expect("reading the table is not refused");
+    assert_eq!(parts.len(), 2, "both entries are still reported");
+
+    let result = PartitionSet::from_probe(&dev).and_then(|set| set.commit(&dev));
+    let after = gpt_entry_array(&dev);
+    assert_eq!(
+        (&after[128..140], &after[256 + 128..256 + 140]),
+        (&b"TAIL-OF-ZERO"[..], &b"TAIL-OF-ONE!"[..]),
+        "an entry's tail was replaced by the other's (commit gave {result:?})"
+    );
+    assert!(
+        matches!(result, Err(Error::GptCorrupt(m)) if m.contains("share a unique partition GUID")),
+        "a set that cannot keep both tails must say so, got {result:?}"
+    );
+    assert_eq!(after, before, "a refused set wrote to the entry array");
+}
+
+/// The same pair after removing one of them: the survivor was given
+/// whichever tail the map kept, which for slot 0 was slot 1's (#81).
+#[test]
+fn removing_one_of_two_entries_sharing_a_uuid_does_not_hand_the_other_its_tail() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let uuids = wide_entry_table(&dev, 2);
+    plant_entry_tail(&dev, 0, b"TAIL-OF-ZERO");
+    plant_entry_tail(&dev, 1, b"TAIL-OF-ONE!");
+    plant_entry_uuid(&dev, 1, uuids[0]);
+
+    let result = PartitionSet::from_probe(&dev).and_then(|mut set| {
+        set.remove(PartitionRef::Index(1))?;
+        set.commit(&dev)
+    });
+    let after = gpt_entry_array(&dev);
+    assert_eq!(
+        &after[128..140],
+        b"TAIL-OF-ZERO",
+        "slot 0 kept its partition but lost its own tail (commit gave {result:?})"
+    );
+    assert!(result.is_err(), "got {result:?}");
+}
+
+/// Sharing a UUID is not refused when the tails are the same: nothing
+/// can be lost, and a clone of a table whose tails are all zero is the
+/// common case.
+#[test]
+fn two_entries_sharing_a_uuid_and_a_tail_still_round_trip() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let uuids = wide_entry_table(&dev, 2);
+    plant_entry_tail(&dev, 0, b"SAME-TAIL");
+    plant_entry_tail(&dev, 1, b"SAME-TAIL");
+    plant_entry_uuid(&dev, 1, uuids[0]);
+
+    let set = PartitionSet::from_probe(&dev).expect("identical tails lose nothing");
+    set.commit(&dev).unwrap();
+    let after = gpt_entry_array(&dev);
+    assert_eq!(&after[128..137], b"SAME-TAIL");
+    assert_eq!(&after[256 + 128..256 + 137], b"SAME-TAIL");
+}
+
+/// Overwrite entry `slot`'s unique GUID and repair both CRCs.
+fn plant_entry_uuid(dev: &MemDev, slot: usize, uuid: [u8; 16]) {
+    let mut header = [0u8; 512];
+    dev.read_at(512, &mut header).unwrap();
+    let array_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let mut array = vec![0u8; count * size];
+    dev.read_at(array_lba * 512, &mut array).unwrap();
+    let at = slot * size + 16;
+    array[at..at + 16].copy_from_slice(&uuid);
+    dev.write_at(array_lba * 512, &array).unwrap();
+    header[88..92].copy_from_slice(&crc32fast::hash(&array).to_le_bytes());
+    header[16..20].fill(0);
+    let crc = crc32fast::hash(&header[..header_size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write_at(512, &header).unwrap();
+}
