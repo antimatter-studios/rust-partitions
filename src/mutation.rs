@@ -370,23 +370,48 @@ impl PartitionSet {
 
     /// Serialise to disk. Dispatches to the GPT or MBR writer depending on
     /// `table_kind`, then flushes the device.
+    ///
+    /// A partition with no slot is given the lowest free one on disk, and
+    /// this set is **not** told which: it takes `&self`. Committing the
+    /// same set again after freeing a lower slot moves that partition —
+    /// renumbering a disk nobody asked to renumber (#69). A caller that
+    /// keeps editing a set after committing it wants [`Self::commit_mut`].
     pub fn commit(&self, dev: &dyn BlockDevice) -> Result<()> {
-        match self.table_kind {
-            TableKind::Gpt => {
-                crate::gpt_write::write_gpt_preserving_tails(
-                    dev,
-                    &self.partitions,
-                    self.disk_guid,
-                    self.gpt_geometry,
-                    &self.gpt_entry_tails,
-                )?;
-            }
-            TableKind::Mbr => {
-                mbr::write_mbr_preserving(dev, &self.partitions, &self.reserved)?;
-            }
+        self.write_and_flush(dev).map(|_| ())
+    }
+
+    /// As [`Self::commit`], and records on each partition the slot it was
+    /// written into, so the set describes the disk it just wrote and a
+    /// later commit keeps every partition where it is.
+    ///
+    /// The slots are recorded only once the write **and** the flush have
+    /// both succeeded: a set carrying slots for a table that never reached
+    /// the disk would place the next commit by a layout that does not
+    /// exist.
+    pub fn commit_mut(&mut self, dev: &dyn BlockDevice) -> Result<()> {
+        let slots = self.write_and_flush(dev)?;
+        for (p, slot) in self.partitions.iter_mut().zip(slots) {
+            p.slot = Some(slot);
         }
-        dev.flush()?;
         Ok(())
+    }
+
+    /// Write the table, flush, and return the slot each partition took.
+    fn write_and_flush(&self, dev: &dyn BlockDevice) -> Result<Vec<u32>> {
+        let slots = match self.table_kind {
+            TableKind::Gpt => crate::gpt_write::write_gpt_assigning_slots(
+                dev,
+                &self.partitions,
+                self.disk_guid,
+                self.gpt_geometry,
+                &self.gpt_entry_tails,
+            )?,
+            TableKind::Mbr => {
+                mbr::write_mbr_assigning_slots(dev, &self.partitions, &self.reserved)?
+            }
+        };
+        dev.flush()?;
+        Ok(slots)
     }
 
     // --- helpers -----------------------------------------------------------

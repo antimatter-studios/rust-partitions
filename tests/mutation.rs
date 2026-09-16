@@ -1884,3 +1884,81 @@ fn the_first_two_partitions_written_read_back_as_slots_zero_and_one() {
         assert_eq!(slots, vec![Some(0), Some(1)], "{table:?}");
     }
 }
+
+/// `commit` gave a partition with no slot the lowest free one on disk and
+/// did not record it, so the set still said `None`. Remove a partition
+/// in a lower slot, commit again, and the lowest free slot is now that
+/// lower one: the partition moved from slot 2 to slot 0 on disk, with
+/// nothing about it changed (#69). `commit_mut` records the slots once
+/// the write and flush succeed.
+#[test]
+fn committing_twice_does_not_renumber_a_partition_the_first_commit_placed() {
+    for table in [TableKind::Gpt, TableKind::Mbr] {
+        let dev = MemDev::new(DISK_64M as usize);
+        let mut set = match table {
+            TableKind::Gpt => PartitionSet::empty_gpt(DISK_64M),
+            TableKind::Mbr => PartitionSet::empty_mbr(DISK_64M),
+        };
+        for label in ["a", "b", "new"] {
+            set.add(
+                None,
+                ONE_MIB,
+                PartitionTypeId::LinuxFilesystem,
+                Some(label.into()),
+            )
+            .unwrap();
+        }
+        set.commit_mut(&dev).unwrap();
+        let slots: Vec<Option<u32>> = set.partitions.iter().map(|p| p.slot).collect();
+        assert_eq!(
+            slots,
+            vec![Some(0), Some(1), Some(2)],
+            "{table:?}: the set records the slots it wrote"
+        );
+
+        set.remove(PartitionRef::Index(0)).unwrap();
+        set.commit_mut(&dev).unwrap();
+
+        let (_, mut parts) = probe(&dev).unwrap();
+        parts.sort_by_key(|p| p.start);
+        let on_disk: Vec<Option<u32>> = parts.iter().map(|p| p.slot).collect();
+        assert_eq!(
+            on_disk,
+            vec![Some(1), Some(2)],
+            "{table:?}: a second commit renumbered the partitions the first one placed"
+        );
+    }
+}
+
+/// A commit that fails records nothing: the set must not describe a
+/// table that never reached the disk. The write lands here and the flush
+/// is what fails, which is the case an ordering mistake would get wrong.
+#[test]
+fn a_commit_mut_whose_flush_fails_records_no_slots() {
+    struct FlushFails(MemDev);
+    impl BlockRead for FlushFails {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            self.0.read_at(offset, buf)
+        }
+        fn size_bytes(&self) -> u64 {
+            self.0.size_bytes()
+        }
+    }
+    impl BlockDevice for FlushFails {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+            self.0.write_at(offset, buf)
+        }
+        fn flush(&self) -> fs_core::Result<()> {
+            Err(fs_core::Error::ReadOnly)
+        }
+        fn is_writable(&self) -> bool {
+            true
+        }
+    }
+    let dev = FlushFails(MemDev::new(DISK_64M as usize));
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(None, ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    assert!(set.commit_mut(&dev).is_err());
+    assert_eq!(set.partitions[0].slot, None);
+}
