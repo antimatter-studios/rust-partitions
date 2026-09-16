@@ -1818,3 +1818,44 @@ fn find_free_does_not_move_its_cursor_back_over_a_nested_partition() {
         "first fit is the first aligned sector past the outer partition"
     );
 }
+
+/// `add` and `resize` round a length to 1 MiB while their doc comments
+/// promised the next sector, and no test handed either a length that was
+/// not already a 1 MiB multiple — deleting both alignments left the
+/// suite green, so neither the doc nor the code was pinned. #42.
+#[test]
+fn add_and_resize_round_a_length_up_to_one_mib_not_one_sector() {
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    let a = set
+        .add(None, 4096, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    assert_eq!(set.partitions[a].length, ONE_MIB, "add(None, 4096)");
+    let b = set
+        .add(None, ONE_MIB + 1, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    assert_eq!(
+        set.partitions[b].length,
+        2 * ONE_MIB,
+        "add(None, 1 MiB + 1)"
+    );
+
+    set.resize(PartitionRef::Index(b), 512).unwrap();
+    assert_eq!(set.partitions[b].length, ONE_MIB, "resize(b, 512)");
+}
+
+/// A start hint below the first usable LBA is raised to it rather than
+/// refused, on both table types. The refusal written beneath that clamp
+/// tested the clamped value and could never fire. #26.
+#[test]
+fn a_start_hint_below_the_usable_range_is_raised_to_it() {
+    for mut set in [
+        PartitionSet::empty_gpt(DISK_64M),
+        PartitionSet::empty_mbr(DISK_64M),
+    ] {
+        let kind = set.table_kind;
+        let idx = set
+            .add(Some(0), ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+            .unwrap_or_else(|e| panic!("{kind:?}: add(Some(0)) refused: {e:?}"));
+        assert_eq!(set.partitions[idx].start, ONE_MIB, "{kind:?}: add(Some(0))");
+    }
+}
