@@ -474,6 +474,50 @@ fn a_zero_length_partition_is_refused_not_underflowed() {
     }
 }
 
+fn span_of(start: u64, length: u64) -> partitions::Result<(u64, u64)> {
+    Partition {
+        start,
+        length,
+        kind: PartitionKind::Gpt {
+            type_guid: type_guids::LINUX_FILESYSTEM,
+            attributes: 0,
+        },
+        label: None,
+        uuid: None,
+        slot: None,
+        issues: 0,
+    }
+    .sector_span()
+}
+
+/// `sector_span` refused a zero-length partition only when it sat below
+/// the first sector boundary, because the refusal was an underflow of
+/// `end / SECTOR_SIZE - 1` rather than a test of the length. Anywhere
+/// else a zero length came back as a span whose first sector is past
+/// its last, and a length ending partway into a sector lost that
+/// sector. Both answers read as "no overlap" to the overlap checks in
+/// `mutation`, which call this on a caller-built `PartitionSet`. #71.
+#[test]
+fn sector_span_refuses_zero_length_anywhere_and_counts_a_partial_last_sector() {
+    for start in [0, 512, 1024, 1 << 40] {
+        match span_of(start, 0) {
+            Err(Error::Invalid(_)) => {}
+            other => panic!(
+                "sector_span(start={start}, length=0) gave {other:?}; a zero-length \
+                 partition has no last sector and must be refused"
+            ),
+        }
+    }
+    assert_eq!(
+        span_of(0, 600).unwrap(),
+        (0, 1),
+        "600 bytes from sector 0 occupy sectors 0 and 1"
+    );
+    assert_eq!(span_of(512, 1).unwrap(), (1, 1));
+    assert_eq!(span_of(0, 512).unwrap(), (0, 0));
+    assert_eq!(span_of(1024, 1024).unwrap(), (2, 3));
+}
+
 // ---------------------------------------------------------------------------
 // The same arithmetic, in the place that writes it to disk
 // ---------------------------------------------------------------------------

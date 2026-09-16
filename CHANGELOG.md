@@ -8,6 +8,14 @@ never does.
 
 ### Fixed
 
+- **`Partition::sector_span` refuses a zero-length partition wherever it
+  starts, and counts a partly-occupied last sector.** The refusal was an
+  underflow that only happened below byte 512, so `{start: 512, length:
+  0}` returned the inverted span `(1, 0)`, and `{start: 0, length: 600}`
+  returned `(0, 0)` for a partition that reaches into sector 1. The
+  overlap checks in `PartitionSet::add`, `resize` and `find_free` read
+  both as "no overlap" on a hand-built set. A set holding a zero-length
+  entry now makes those calls return `Error::Invalid` (#71).
 - **A GPT label is no longer dropped for the sake of its last
   character.** The name field holds 36 UTF-16 code units and a character
   outside the basic multilingual plane takes two of them, so cutting at
