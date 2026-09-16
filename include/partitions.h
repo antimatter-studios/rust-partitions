@@ -147,7 +147,9 @@ FsCoreErrorCode  partitions_get(const PartitionList *list,
                                  PartitionInfo *out);
 /* Returns one of PartitionsFsKind, or -1 on error (last-error has detail). */
 int32_t          partitions_sniff(const PartitionList *list, size_t index);
-/* Sniff the whole device (no partition table). Returns one of PartitionsFsKind, or -1 on error. */
+/* Sniff the whole device (no partition table). Returns one of PartitionsFsKind, or -1 on error.
+ * A device_size_bytes below the device's real size that recognises nothing is an error, not
+ * PART_FS_UNKNOWN: the bytes that could have identified the filesystem were never read. */
 int32_t          partitions_sniff_device(const FsCoreDevice *device,
                                           uint64_t device_size_bytes);
 /* Returns NULL on error (last-error has detail). */

@@ -8,6 +8,22 @@ never does.
 
 ### Fixed
 
+- **`sniff` refuses a partition starting at or past the end of the
+  device before sizing its window.** It relied on the read to fail, and
+  a zero-length read is `Ok` at any offset on a real `FileDevice`, so a
+  region entirely off the device was sniffed as `Unknown` while
+  `partitions_open_slice` refused the same entry. The test mock now
+  behaves like `FileDevice` on an empty read (#53).
+- **A 64 KiB-page Linux swap partition is recognised through `sniff`.**
+  The window was 0x8800 bytes, sized for ISO9660, while `classify`
+  probes swap pages up to 64 KiB. The window is now `sniff::WINDOW`,
+  derived from the furthest probe (65536 bytes), which also means every
+  sniff reads up to 65536 bytes instead of 34816 (#25).
+- **`partitions_sniff_device` no longer answers `PART_FS_UNKNOWN` for a
+  window its declared size cut short.** A declared size below both the
+  device's real size and `sniff::WINDOW` that recognises nothing now
+  returns -1 with a last-error naming both sizes; a recognised
+  filesystem in a short window is still returned (#83).
 - **`Partition::sector_span` refuses a zero-length partition wherever it
   starts, and counts a partly-occupied last sector.** The refusal was an
   underflow that only happened below byte 512, so `{start: 512, length:

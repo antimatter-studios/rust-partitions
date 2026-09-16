@@ -338,6 +338,12 @@ pub unsafe extern "C" fn partitions_sniff(list: *const PartitionList, index: usi
 /// is the virtual size of the device (from `fs_core_device_size_bytes`).
 /// Returns a [`FsKindCode`] discriminant as `i32`, or -1 on error
 /// (last-error has detail).
+///
+/// A declared size smaller than both the device and
+/// [`sniff::WINDOW`](crate::sniff::WINDOW) that recognises nothing
+/// returns -1 rather than `PART_FS_UNKNOWN`: the bytes that might have
+/// identified the filesystem were never read, so "unknown" would be a
+/// guess.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn partitions_sniff_device(
     device: *const FsCoreDevice,
@@ -364,6 +370,24 @@ pub unsafe extern "C" fn partitions_sniff_device(
             issues: 0,
         };
         match sniff::sniff(&*parent, &synthetic) {
+            // Nothing recognised in a window the declared size cut short
+            // of bytes the device has is not a negative: an ISO9660
+            // device declared at 32768 bytes reads exactly like an empty
+            // one. No single minimum size fixes that — NTFS is
+            // recognisable in 512 bytes and ISO9660 needs 32774 — so
+            // only this inconclusive shape is refused (#83).
+            Ok(FsKind::Unknown)
+                if device_size_bytes < sniff::WINDOW && device_size_bytes < parent.size_bytes() =>
+            {
+                set_last_error(format!(
+                    "partitions_sniff_device: nothing recognised in the first \
+                     {device_size_bytes} bytes, but the device has {} and sniffing \
+                     reads up to {}; pass the device's size to get an answer",
+                    parent.size_bytes(),
+                    sniff::WINDOW,
+                ));
+                -1
+            }
             Ok(kind) => FsKindCode::from(kind) as i32,
             Err(e) => {
                 set_last_error(e.to_string());
