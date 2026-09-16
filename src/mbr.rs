@@ -95,6 +95,8 @@ pub mod types {
     pub const EXTENDED_LBA: u8 = 0x0F;
     pub const LINUX_SWAP: u8 = 0x82;
     pub const LINUX: u8 = 0x83;
+    /// The Linux extended container: a chain of EBRs, like `0x05`/`0x0F`.
+    pub const LINUX_EXTENDED: u8 = 0x85;
     pub const LINUX_LVM: u8 = 0x8E;
     pub const HFS_PLUS: u8 = 0xAF;
     pub const SOLARIS: u8 = 0xBF;
@@ -139,7 +141,7 @@ pub const STATUS_ACTIVE: u8 = 0x80;
 pub enum EntryRole {
     /// A partition holding data: what a caller means by "a volume".
     Volume,
-    /// An extended-partition container (`0x05` / `0x0F`). Its contents
+    /// An extended-partition container (`0x05` / `0x0F` / `0x85`). Its contents
     /// are a linked list of EBRs — partition tables, not a filesystem.
     ExtendedContainer,
     /// The `0xEE` marker that says the real table is the GPT. Spans the
@@ -150,7 +152,12 @@ pub enum EntryRole {
 /// What the entry with this type byte describes. See [`EntryRole`].
 pub fn entry_role(type_byte: u8) -> EntryRole {
     match type_byte {
-        types::EXTENDED_CHS | types::EXTENDED_LBA => EntryRole::ExtendedContainer,
+        // The three the Linux kernel's msdos parser and libfdisk walk as
+        // a chain. 0x85 was missing, so a Linux container was reported
+        // as a volume (#70).
+        types::EXTENDED_CHS | types::EXTENDED_LBA | types::LINUX_EXTENDED => {
+            EntryRole::ExtendedContainer
+        }
         types::GPT_PROTECTIVE => EntryRole::GptProtective,
         _ => EntryRole::Volume,
     }
