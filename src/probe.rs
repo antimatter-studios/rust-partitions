@@ -25,9 +25,11 @@ pub struct Partition {
     /// The slot this entry occupies in the on-disk table, or `None` for
     /// a partition that has not been placed in one yet.
     ///
-    /// The slot is the partition's identity to everything above this
-    /// crate: it is the `3` in `/dev/sda3` and the `s3` in `disk4s3`. A
-    /// table with a hole in it is routine — it is what a deletion
+    /// **Zero-based**: the first entry of the table is slot 0. The slot
+    /// is the partition's identity to everything above this crate, which
+    /// numbers from one — the `N` in `/dev/sdaN` and `diskXsN` is
+    /// `slot + 1`, so slot 2 is `/dev/sda3`. A table with a hole in it
+    /// is routine — it is what a deletion
     /// leaves, and it is the normal state of a macOS disk, where slot
     /// numbering is not compacted — so the position of an entry in the
     /// returned `Vec` is not its number and never was.

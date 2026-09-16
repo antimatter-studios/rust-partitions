@@ -138,11 +138,11 @@ pub struct PartitionInfo {
     /// The slot this entry occupies in the on-disk table, or `-1` when
     /// it has none (a whole-device entry).
     ///
-    /// The slot is the partition's number to everything above this
-    /// crate — the `3` in `/dev/sda3`, the `s3` in `disk4s3`. A table
-    /// with a hole in it is routine, so the index a caller passed to
-    /// [`partitions_get`] is not the partition's number and never was.
-    /// See [`crate::Partition::slot`].
+    /// **Zero-based**: the first entry of the table is slot 0. The
+    /// number the system shows — `N` in `/dev/sdaN` or `diskXsN` — is
+    /// `slot + 1`, so slot 2 is `/dev/sda3`. A table with a hole in it
+    /// is routine, so the index a caller passed to [`partitions_get`]
+    /// is not the slot and never was. See [`crate::Partition::slot`].
     pub slot: i32,
     /// Which of the table's own rules this entry breaks, as a set of
     /// [`crate::gpt::entry_issue`] bits — 0 when it breaks none.
@@ -677,9 +677,10 @@ mod tests {
         FsCoreDevice::into_handle(Arc::new(Bytes(Mutex::new(bytes))))
     }
 
-    /// The number a C caller shows a user is the table slot, not the
-    /// index it looped over. With three empty slots in front of it, the
-    /// only entry on this disk is at index 0 and in slot 2.
+    /// `slot` is the entry's zero-based position in the table, not the
+    /// index a C caller looped over. With two empty slots in front of
+    /// it, the only entry on this disk is at index 0 and in slot 2 —
+    /// the system's `/dev/sda3`.
     #[test]
     fn partition_info_carries_the_table_slot_not_the_list_index() {
         let dev = make_mbr_device_in_slot_two();
