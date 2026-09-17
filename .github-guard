@@ -1,0 +1,56 @@
+# .github-guard — declarations github-guard reads (see the github-guard skill:
+# https://github.com/antimatter-studios/agent-skills/blob/main/.claude/skills/github-guard/README.md).
+# git-config format: check with `git config -f .github-guard --list`, and
+# double-quote any value containing # or ;.
+
+# Required status checks for main. A declaration beats discovery exactly.
+#
+# Discovery requires checks BY JOB NAME, which is a guess at the PR gate and
+# drifts silently: a renamed job, an added workflow, or any future check
+# reporting under the github-actions app changes what is required without
+# anyone deciding to. Pinning it costs nothing and makes the intent reviewable.
+#
+# THIS ONE IS A PIN, NOT A CORRECTION, AND THAT IS THE REASON TO WRITE IT.
+# Measured 2026-09-17 against this repository: branch protection already
+# required exactly the five names below, and ci.yml on main (commit b9a9d82,
+# run 35176029936) produced exactly those five and nothing else -- on main's
+# check-runs and on the last pull_request check-suite (95263140349, #115)
+# alike. Nothing is being fixed here. What is being fixed is that the list
+# lived only on the settings page, where it has no diff, no reviewer and no
+# history: the next matrix leg added to ci.yml reports under a new name,
+# nobody adds it to the required set, and the repository is one job greener
+# than it is tested with no commit to point at. The sibling rust-img-qcow2
+# is that failure already -- it produces `test / i686-unknown-linux-gnu`,
+# which was never required, so a red leg there never blocked a merge. This
+# file is where that divergence becomes a pull request instead of a surprise.
+# See the constellation audit, diskjockey#197 (sections 1 and 7).
+#
+# Every name here runs on `pull_request`, which is the only kind that can
+# gate one. release.yml's `test` and `publish to crates.io` jobs trigger on
+# a `v*.*.*` tag, after the merge they would be gating has already happened,
+# so declaring either would require a check that never reports on a pull
+# request and would block every merge permanently. They are deliberately
+# absent. No third-party reviewer app reports on this repository today;
+# github-protect-main.sh filters `select(.app.slug=="github-actions")` on
+# every one of its queries in any case, so one appearing later cannot become
+# required by accident.
+#
+# There is no aggregate `ci-ok`-style job here that `needs:` the rest, so the
+# real job names are declared. An aggregate is the better end state -- it
+# makes the required set one name that cannot drift -- but adding one is a
+# workflow change with its own reasoning and does not belong in the commit
+# that writes down what is already true.
+#
+# Names must match the check-run names GitHub reports, including the
+# "test / <os>" job-matrix spelling, which has spaces around the slash
+# because Actions renders `name: test / ${{ matrix.os }}`. `test (release)`
+# has no spaces around its brackets and is not a matrix leg at all -- it is
+# the job named `test-release` carrying `name: test (release)`. The two
+# spellings are not interchangeable and a wrong one is a check that never
+# reports.
+[checks]
+	required = fmt
+	required = test (release)
+	required = test / macos-latest
+	required = test / ubuntu-latest
+	required = test / windows-latest
