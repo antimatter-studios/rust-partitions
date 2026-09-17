@@ -6,6 +6,18 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **The backup GPT is consulted, and the caller is told.** `probe_with_status`
+  returns the table kind, the partitions and a `TableSource`: the primary with
+  the backup agreeing, the primary with a stale or damaged backup, or
+  partitions recovered from the backup because the primary could not be read.
+  A disk whose first sectors were overwritten read as unpartitioned, where
+  gdisk, parted and Linux recover it, and a stale backup was never reported.
+  `probe` is unchanged. The C ABI's `partitions_probe` now probes this way,
+  and `partitions_table_source` returns the source as
+  `PartitionsTableSource` (#30).
+
 ### Fixed
 
 - **A 4Kn GPT header larger than 512 bytes is still recognised as 4Kn.**

@@ -59,6 +59,18 @@ typedef enum {
     PART_TABLE_MBR  = 2,
 } PartitionsTableKind;
 
+/* Which copy of the table partitions_probe read. A GPT whose primary could
+ * not be read is recovered from the backup at the end of the disk; the two
+ * copies then disagree, and a caller should say so before acting on the
+ * table, and above all before writing it. Stable: do not renumber. */
+typedef enum {
+    PART_SOURCE_NONE                      = 0,
+    PART_SOURCE_MBR                       = 1,
+    PART_SOURCE_GPT_PRIMARY               = 2,
+    PART_SOURCE_GPT_PRIMARY_BACKUP_STALE  = 3,
+    PART_SOURCE_GPT_RECOVERED_FROM_BACKUP = 4,
+} PartitionsTableSource;
+
 /* -------------------------------------------------------------------------
  * PartitionInfo — POD struct copied out by partitions_get. The `label`
  * pointer (when non-NULL) and `type_guid` are owned by the parent
@@ -139,10 +151,15 @@ typedef struct PartitionList PartitionList;
  * Entry points.
  * ------------------------------------------------------------------------- */
 
+/* A GPT whose primary copy cannot be read is recovered from its backup, and a
+ * primary whose backup disagrees is still returned: check
+ * partitions_table_source before acting on the list. */
 FsCoreErrorCode  partitions_probe(const FsCoreDevice *device,
                                    PartitionList **list_out);
 size_t           partitions_count(const PartitionList *list);
 int32_t          partitions_table_kind(const PartitionList *list);
+/* One of PartitionsTableSource; PART_SOURCE_NONE for a NULL list. */
+int32_t          partitions_table_source(const PartitionList *list);
 FsCoreErrorCode  partitions_get(const PartitionList *list,
                                  size_t index,
                                  PartitionInfo *out);
