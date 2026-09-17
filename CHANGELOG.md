@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A 4Kn GPT header larger than 512 bytes is still recognised as 4Kn.**
+  The 4Kn check read a 512-byte sector at byte 4096 and `parse_header`
+  capped `header_size` at 512, while a header may fill its 4096-byte
+  logical block. Such a disk was reported as a corrupt table instead of
+  refused by its sector size. The check now reads the whole block and
+  accepts a `header_size` up to it (#75).
 - **A GPT commit keeps a hybrid disk's MBR.** A hybrid (a GPT with
   partitions mirrored into LBA 0, as Boot Camp and isohybrid images carry)
   was probed as GPT, and every commit -- including one that changed
