@@ -14,10 +14,18 @@
 //! same struct at runtime, then compiles it. Drift on either side — a field
 //! added to the Rust struct, a field missed in the header, a type changed in
 //! one and not the other — is a compile error naming the field.
+//!
+//! That answers the struct half and cannot answer the function half: an
+//! object file compiled with `-c` resolves no symbol, and the generated C
+//! names no function. `c_header_functions_link_against_the_built_library`
+//! takes the address of every function the header declares and links the
+//! result against the `libpartitions.a` this same `cargo test` built, so a
+//! declaration the archive does not export is a link error here rather
+//! than in a consumer's build (#35).
 
 use std::fs;
 use std::mem::{align_of, offset_of, size_of};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use partitions::capi::PartitionInfo;
@@ -106,6 +114,99 @@ fn find_c_compiler() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A C compiler that builds for `triple`, the Rust target the test binary
+/// was built for.
+///
+/// `CC_<triple>` (with `-` or `_`) and then `TARGET_CC`, the variables cc-rs
+/// reads for the same purpose. Failing those, the host compiler, but only
+/// if `-dumpmachine` says it builds for the same architecture and system:
+/// `cargo test --target <triple>` on the machine that is that triple is the
+/// ordinary case, and it needs nothing set.
+fn target_c_compiler(triple: &str) -> Option<String> {
+    let underscored = triple.replace('-', "_");
+    for var in [
+        format!("CC_{triple}"),
+        format!("CC_{underscored}"),
+        "TARGET_CC".to_owned(),
+    ] {
+        if let Ok(cc) = std::env::var(&var) {
+            if !cc.is_empty() {
+                return Some(cc);
+            }
+        }
+    }
+    let cc = find_c_compiler()?;
+    let machine = Command::new(&cc).arg("-dumpmachine").output().ok()?;
+    let machine = String::from_utf8_lossy(&machine.stdout);
+    compiler_builds_for(machine.trim(), triple).then_some(cc)
+}
+
+/// Whether a compiler whose `-dumpmachine` is `machine` builds for the Rust
+/// target `triple`: same architecture (Apple spells aarch64 `arm64`), same
+/// system, and on Linux the same C library and ABI. A glibc compiler does
+/// not link a `-musl` static library, so `x86_64-linux-gnu` is not a
+/// compiler for `x86_64-unknown-linux-musl`. A Linux `-dumpmachine` that
+/// names no environment (`x86_64-redhat-linux`) is a glibc one.
+fn compiler_builds_for(machine: &str, triple: &str) -> bool {
+    let arch = |t: &str| match t.split('-').next().unwrap_or("") {
+        "arm64" => "aarch64".to_owned(),
+        other => other.to_owned(),
+    };
+    let system = |t: &str| {
+        ["linux", "darwin", "windows", "freebsd"]
+            .into_iter()
+            .find(|os| t.contains(os))
+    };
+    let environment = |t: &str| match t.split_once("linux") {
+        Some((_, rest)) => match rest.trim_start_matches('-') {
+            "" => "gnu".to_owned(),
+            env => env.to_owned(),
+        },
+        None => String::new(),
+    };
+    !machine.is_empty()
+        && arch(machine) == arch(triple)
+        && system(machine) == system(triple)
+        && environment(machine) == environment(triple)
+}
+
+#[test]
+fn a_host_compiler_is_used_for_a_target_only_when_it_builds_for_it() {
+    for (machine, triple, same) in [
+        ("aarch64-linux-gnu", "aarch64-unknown-linux-gnu", true),
+        ("x86_64-linux-gnu", "x86_64-unknown-linux-gnu", true),
+        ("arm64-apple-darwin23.4.0", "aarch64-apple-darwin", true),
+        ("x86_64-linux-gnu", "aarch64-unknown-linux-gnu", false),
+        ("aarch64-linux-gnu", "aarch64-apple-darwin", false),
+        ("arm64-apple-darwin23.4.0", "x86_64-apple-darwin", false),
+        ("", "x86_64-unknown-linux-gnu", false),
+        // The C library and ABI are part of the target (Greptile on #111).
+        ("x86_64-linux-gnu", "x86_64-unknown-linux-musl", false),
+        (
+            "x86_64-alpine-linux-musl",
+            "x86_64-unknown-linux-gnu",
+            false,
+        ),
+        (
+            "x86_64-alpine-linux-musl",
+            "x86_64-unknown-linux-musl",
+            true,
+        ),
+        (
+            "aarch64-linux-gnu",
+            "aarch64-unknown-linux-gnu_ilp32",
+            false,
+        ),
+        ("x86_64-redhat-linux", "x86_64-unknown-linux-gnu", true),
+    ] {
+        assert_eq!(
+            compiler_builds_for(machine, triple),
+            same,
+            "{machine} for {triple}"
+        );
+    }
+}
+
 #[test]
 fn c_header_matches_rust_struct() {
     let Some(cc) = find_c_compiler() else {
@@ -153,6 +254,267 @@ fn c_header_matches_rust_struct() {
         "include/partitions.h disagrees with the Rust #[repr(C)] structs in src/capi.rs.\n\
          Compiler: {cc}\n\
          {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Every `partitions_*` function `header` declares, comments removed.
+///
+/// A scan rather than a C parser, like the rest of this file's reading of
+/// the header: a declaration is the identifier followed by `(`. Comments
+/// are stripped first because the header's usage notes name functions
+/// too, and a note is not a declaration.
+fn declared_functions(header: &str) -> Vec<String> {
+    let mut code = String::new();
+    let mut rest = header;
+    while let Some(start) = rest.find("/*") {
+        code.push_str(&rest[..start]);
+        rest = match rest[start..].find("*/") {
+            Some(end) => &rest[start + end + 2..],
+            None => "",
+        };
+    }
+    code.push_str(rest);
+
+    let mut names: Vec<String> = Vec::new();
+    let bytes = code.as_bytes();
+    let mut i = 0;
+    while let Some(found) = code[i..].find("partitions_") {
+        let at = i + found;
+        let starts_word =
+            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        let mut end = at;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        let after = code[end..].trim_start();
+        if starts_word && after.starts_with('(') {
+            let name = code[at..end].to_owned();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        i = end;
+    }
+    names
+}
+
+#[test]
+fn the_declaration_scan_reads_declarations_and_not_comments() {
+    let header = "/* partitions_in_a_comment(x) */\n\
+                  int32_t partitions_count(const PartitionList *list);\n\
+                  FsCoreDevice   *partitions_open_slice (const PartitionList *list, size_t i);\n\
+                  typedef struct PartitionList PartitionList;\n\
+                  int32_t not_partitions_ours(void);\n";
+    assert_eq!(
+        declared_functions(header),
+        vec!["partitions_count", "partitions_open_slice"]
+    );
+}
+
+/// The `cargo build` arguments that reproduce the build of the test binary
+/// at `exe`, and where that build puts `libpartitions.a`.
+///
+/// The binary is at `<target-dir>/[<triple>/]<profile-dir>/deps/<name>`.
+/// Forwarding `--release` alone put the archive somewhere else under
+/// `cargo test --target <triple>` or `--profile <custom>`, and the check
+/// failed with a correct ABI (Greptile on #111). The target directory is
+/// the one holding cargo's `CACHEDIR.TAG`; a directory between it and the
+/// profile is a target triple; and the profile directory is `debug` for
+/// the dev profile, `release` for release, or the custom profile's name.
+fn nested_build(exe: &Path) -> (Vec<String>, PathBuf) {
+    let profile_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("<profile-dir> above deps/");
+    let above = profile_dir.parent().expect("a directory above the profile");
+    let (target_dir, triple) = if above.join("CACHEDIR.TAG").exists() {
+        (above, None)
+    } else {
+        let root = above.parent().expect("a target directory above the triple");
+        (root, above.file_name().and_then(|n| n.to_str()))
+    };
+    let mut args = vec![
+        "--target-dir".to_owned(),
+        target_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(triple) = triple {
+        args.extend(["--target".to_owned(), triple.to_owned()]);
+    }
+    match profile_dir.file_name().and_then(|n| n.to_str()) {
+        Some("debug") | None => {}
+        Some("release") => args.push("--release".to_owned()),
+        Some(custom) => args.extend(["--profile".to_owned(), custom.to_owned()]),
+    }
+    (args, profile_dir.join("libpartitions.a"))
+}
+
+#[test]
+fn the_nested_build_follows_the_target_and_profile_of_the_test_binary() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let target = root.path().join("tgt");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let t = target.to_string_lossy().into_owned();
+    for (exe, args, archive) in [
+        (
+            target.join("debug/deps/c_abi-1"),
+            vec!["--target-dir", &t],
+            target.join("debug/libpartitions.a"),
+        ),
+        (
+            target.join("release/deps/c_abi-1"),
+            vec!["--target-dir", &t, "--release"],
+            target.join("release/libpartitions.a"),
+        ),
+        (
+            target.join("aarch64-unknown-linux-gnu/release/deps/c_abi-1"),
+            vec![
+                "--target-dir",
+                &t,
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--release",
+            ],
+            target.join("aarch64-unknown-linux-gnu/release/libpartitions.a"),
+        ),
+        (
+            target.join("x86_64-apple-darwin/ci-fast/deps/c_abi-1"),
+            vec![
+                "--target-dir",
+                &t,
+                "--target",
+                "x86_64-apple-darwin",
+                "--profile",
+                "ci-fast",
+            ],
+            target.join("x86_64-apple-darwin/ci-fast/libpartitions.a"),
+        ),
+    ] {
+        let (got_args, got_archive) = nested_build(&exe);
+        assert_eq!(got_args, args, "{exe:?}");
+        assert_eq!(got_archive, archive, "{exe:?}");
+    }
+}
+
+#[test]
+fn c_header_functions_link_against_the_built_library() {
+    if cfg!(target_os = "windows") {
+        // The archive is `partitions.lib` for an MSVC linker there; the
+        // POSIX link below is not the question that runner can answer.
+        eprintln!("skipping the C link check on Windows");
+        return;
+    }
+    // `cargo test` builds the library as an rlib for the tests and does
+    // not produce the staticlib, so build it here -- every time, so the
+    // archive linked is this tree's and not a stale one left behind -- into
+    // the same target directory, for the same target and profile, that
+    // built this test binary.
+    let exe = std::env::current_exe().expect("test executable path");
+    let (build_args, archive) = nested_build(&exe);
+    let triple = build_args
+        .iter()
+        .position(|a| a == "--target")
+        .and_then(|i| build_args.get(i + 1))
+        .cloned();
+
+    let cc = match &triple {
+        None => find_c_compiler(),
+        Some(triple) => match target_c_compiler(triple) {
+            Some(cc) => Some(cc),
+            None => {
+                // A `--target` build with no C compiler for that target:
+                // linking a host object against a foreign archive fails
+                // for a reason that has nothing to do with the ABI
+                // (Greptile on #111). Not a CI failure either -- cross
+                // runs set `CC_<triple>` when they want this check.
+                eprintln!(
+                    "no C compiler for {triple} (set CC_{} or TARGET_CC); skipping C link check",
+                    triple.replace('-', "_")
+                );
+                return;
+            }
+        },
+    };
+    let Some(cc) = cc else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no C compiler found in CI — the C ABI link check would have been skipped"
+        );
+        eprintln!("no C compiler found (tried $CC, cc, clang, gcc); skipping C link check");
+        return;
+    };
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let mut build = Command::new(&cargo);
+    build.args(["build", "--locked", "--lib"]).args(&build_args);
+    let built = build
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {cargo}: {e}"));
+    assert!(
+        built.status.success(),
+        "building the staticlib failed:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(
+        archive.exists(),
+        "{} does not exist: the staticlib this test links against was not built",
+        archive.display()
+    );
+
+    let header_text =
+        fs::read_to_string("include/partitions.h").expect("read include/partitions.h");
+    let functions = declared_functions(&header_text);
+    assert!(
+        functions.iter().any(|f| f == "partitions_probe"),
+        "the declaration scan found {functions:?}, which does not include partitions_probe"
+    );
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let include = dir.path();
+    fs::copy("include/partitions.h", include.join("partitions.h")).expect("copy header");
+    let sibling = Path::new("../rust-fs-core/include/fs_core.h");
+    if sibling.exists() {
+        fs::copy(sibling, include.join("fs_core.h")).expect("copy sibling fs_core.h");
+    } else {
+        fs::write(include.join("fs_core.h"), FS_CORE_STUB).expect("write fs_core.h stand-in");
+    }
+
+    let mut c = String::from(
+        "/* Generated by tests/c_abi.rs. Links nothing it does not name. */\n\
+         #include \"partitions.h\"\n\
+         int main(void) {\n    void *functions[] = {\n",
+    );
+    for f in &functions {
+        c.push_str(&format!("        (void *)&{f},\n"));
+    }
+    c.push_str("    };\n    return (int)(sizeof functions / sizeof functions[0]) == 0;\n}\n");
+    let source = include.join("link_check.c");
+    fs::write(&source, c).expect("write link_check.c");
+
+    let mut link = Command::new(&cc);
+    link.arg("-std=c11")
+        .arg("-I")
+        .arg(include)
+        .arg(&source)
+        .arg(&archive)
+        .arg("-o")
+        .arg(include.join("link_check"));
+    if cfg!(target_os = "linux") {
+        // What a Rust staticlib needs from the platform on glibc.
+        link.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let output = link
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {cc}: {e}"));
+    assert!(
+        output.status.success(),
+        "a C program referencing every function include/partitions.h declares \
+         ({functions:?}) does not link against {}.\nCompiler: {cc}\n{}",
+        archive.display(),
         String::from_utf8_lossy(&output.stderr)
     );
 }

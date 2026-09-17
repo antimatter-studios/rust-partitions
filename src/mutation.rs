@@ -118,9 +118,13 @@ pub struct PartitionSet {
     /// The MBR entries `probe` did not report — an extended container,
     /// a hybrid `0xEE` marker — each with the slot it occupies.
     ///
-    /// `commit` writes these back verbatim, and `add` counts them
-    /// against the four primary slots. Empty for a GPT set and for a
-    /// set built from scratch, which have nothing to preserve.
+    /// For an MBR set, `commit` writes these back verbatim, and `add`
+    /// counts them against the four primary slots. For a GPT set that
+    /// came off a disk they are LBA 0's entries as found: the `0xEE`
+    /// marker, and on a hybrid disk the entries mirrored from the GPT,
+    /// which `commit` keeps (with the boot code) rather than replacing
+    /// LBA 0 with a bare protective MBR (#66). Empty for a set built
+    /// from scratch, which has nothing to preserve.
     pub reserved: Vec<mbr::ReservedEntry>,
 }
 
@@ -134,12 +138,14 @@ impl PartitionSet {
         // Re-read LBA 0 for the entries the probe filtered out. `probe`
         // returns the volumes, which is right for a caller mounting
         // from the table and wrong for one about to write it back.
-        let reserved = if table_kind == TableKind::Mbr {
+        let reserved = {
             let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
             dev.read_at(0, &mut sector)?;
-            mbr::reserved_entries(&sector)
-        } else {
-            Vec::new()
+            if table_kind == TableKind::Mbr {
+                mbr::reserved_entries(&sector)
+            } else {
+                mbr::lba0_entries(&sector)
+            }
         };
         let (disk_guid, gpt_geometry, gpt_entry_tails) = if table_kind == TableKind::Gpt {
             // Re-read LBA 1 for the disk GUID and the table's shape.
@@ -271,9 +277,9 @@ impl PartitionSet {
             return Err(Error::Invalid("partition exceeds MBR 32-bit LBA range"));
         }
 
-        // Overlap check against existing partitions.
-        for p in &self.partitions {
-            let (p_start, p_end) = p.sector_span()?;
+        // Overlap check against existing partitions, and against the
+        // ranges preserved entries claim (#67).
+        for (p_start, p_end) in self.occupied_spans(None)? {
             if start_lba <= p_end && end_lba >= p_start {
                 return Err(Error::Invalid("partition overlaps existing entry"));
             }
@@ -350,11 +356,7 @@ impl PartitionSet {
         }
 
         // Overlap check excluding self.
-        for (j, p) in self.partitions.iter().enumerate() {
-            if j == idx {
-                continue;
-            }
-            let (p_start, p_end) = p.sector_span()?;
+        for (p_start, p_end) in self.occupied_spans(Some(idx))? {
             if start_lba <= p_end && new_end_lba >= p_start {
                 return Err(Error::Invalid("resize would overlap another partition"));
             }
@@ -405,6 +407,7 @@ impl PartitionSet {
                 self.disk_guid,
                 self.gpt_geometry,
                 &self.gpt_entry_tails,
+                &self.reserved,
             )?,
             TableKind::Mbr => {
                 mbr::write_mbr_assigning_slots(dev, &self.partitions, &self.reserved)?
@@ -493,12 +496,14 @@ impl PartitionSet {
 
     /// First-fit free-space finder, walking partitions sorted by start LBA.
     fn find_free(&self, length_sectors: u64, first_usable: u64, last_usable: u64) -> Result<u64> {
-        let mut sorted: Vec<&Partition> = self.partitions.iter().collect();
-        sorted.sort_by_key(|p| p.start);
+        // Reserved ranges are merged into the same sorted walk, not
+        // appended after it: the cursor only moves forward (#27), so a
+        // range visited out of order would be stepped over.
+        let mut sorted = self.occupied_spans(None)?;
+        sorted.sort_unstable();
 
         let mut cursor = align_up(first_usable, ALIGNMENT_SECTORS);
-        for p in &sorted {
-            let (p_start, p_end) = p.sector_span()?;
+        for &(p_start, p_end) in &sorted {
             let wanted_end = cursor.saturating_add(length_sectors).saturating_sub(1);
             if wanted_end < p_start {
                 // Gap before this partition is big enough.
@@ -517,6 +522,28 @@ impl PartitionSet {
         } else {
             Err(Error::Invalid("no free space large enough"))
         }
+    }
+}
+
+impl PartitionSet {
+    /// Every inclusive LBA range a new or resized partition must stay out
+    /// of: the partitions (except `skip`), and the ranges preserved MBR
+    /// entries claim -- an extended container, not a `0xEE` marker. See
+    /// [`mbr::ReservedEntry::span`].
+    fn occupied_spans(&self, skip: Option<usize>) -> Result<Vec<(u64, u64)>> {
+        let mut spans = Vec::with_capacity(self.partitions.len() + self.reserved.len());
+        for (j, p) in self.partitions.iter().enumerate() {
+            if Some(j) != skip {
+                spans.push(p.sector_span()?);
+            }
+        }
+        // On a GPT disk LBA 0's entries are the marker and mirrors of
+        // GPT partitions, which claim nothing of their own: a mirror's
+        // range would otherwise stop its own partition being resized.
+        if self.table_kind == TableKind::Mbr {
+            spans.extend(self.reserved.iter().filter_map(mbr::ReservedEntry::span));
+        }
+        Ok(spans)
     }
 }
 

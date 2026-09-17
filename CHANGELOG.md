@@ -14,6 +14,21 @@ never does.
   logical block. Such a disk was reported as a corrupt table instead of
   refused by its sector size. The check now reads the whole block and
   accepts a `header_size` up to it (#75).
+- **A GPT commit keeps a hybrid disk's MBR.** A hybrid (a GPT with
+  partitions mirrored into LBA 0, as Boot Camp and isohybrid images carry)
+  was probed as GPT, and every commit -- including one that changed
+  nothing -- replaced LBA 0 with a bare protective MBR, erasing the
+  mirrored entries and the boot code. `from_probe` now records LBA 0's
+  entries for a GPT set, and the writer keeps the boot code and each
+  mirror whose partition is still written, and puts the `0xEE` marker back
+  in the slot it came from. A set built from scratch still writes a bare
+  protective MBR (#66, #82).
+- **A new partition is not placed over an MBR extended container.** `add`,
+  `find_free`, `resize` and the MBR writer's overlap pass walked only the
+  volumes, and the container is a preserved entry, so `add` placed a
+  partition over it and `commit` returned `Ok(())`. `ReservedEntry::span`
+  gives each preserved entry's range -- none for a `0xEE` marker, by type,
+  or an entry with no sectors -- and all four now respect it (#67).
 - **Two GPT entries sharing a UUID no longer trade entry tails on commit.**
   `PartitionSet` keeps each wide entry's tail bytes keyed by UUID, so a
   cloned table with a duplicate UUID kept one tail for both, and a commit
