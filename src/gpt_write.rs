@@ -448,7 +448,7 @@ pub(crate) fn write_gpt_assigning_slots(
         let mut current = [0u8; crate::SECTOR_SIZE_USIZE];
         dev.read_at(0, &mut current)?;
         let protective: [u8; 16] = mbr[446..462].try_into().expect("sixteen bytes");
-        mbr = hybrid_lba0(&current, lba0, protective, partitions);
+        mbr = hybrid_lba0(&current, lba0, protective, partitions)?;
     }
     dev.write_at(0, &mbr)?;
 
@@ -639,13 +639,25 @@ fn build_header(
 ///   GPT now has -- IN THE SLOT THE OLD ONE OCCUPIED, since a hybrid's
 ///   marker need not be in slot 0, and a first free slot when there was
 ///   none.
+///
+/// Refused, before anything is written: an entry whose slot is not one of
+/// the four (`reserved` is public), and a table with no marker and no
+/// free slot, where placing the marker would overwrite a kept entry.
 fn hybrid_lba0(
     current: &[u8; crate::SECTOR_SIZE_USIZE],
     lba0: &[crate::mbr::ReservedEntry],
     protective: [u8; 16],
     partitions: &[Partition],
-) -> [u8; crate::SECTOR_SIZE_USIZE] {
+) -> Result<[u8; crate::SECTOR_SIZE_USIZE]> {
     use crate::mbr::{entry_role, layout, types, EntryRole};
+    if lba0
+        .iter()
+        .any(|entry| entry.slot as usize >= layout::ENTRY_COUNT)
+    {
+        return Err(Error::Invalid(
+            "reserved entry slot past the end of the table",
+        ));
+    }
     let mut out = [0u8; crate::SECTOR_SIZE_USIZE];
     out[..layout::TABLE_START].copy_from_slice(&current[..layout::TABLE_START]);
     let field = |bytes: &[u8; 16], at: usize| {
@@ -678,12 +690,14 @@ fn hybrid_lba0(
             (0..layout::ENTRY_COUNT)
                 .find(|&i| out[layout::entry_at(i) + layout::TYPE_BYTE] == types::EMPTY)
         })
-        .unwrap_or(0);
+        .ok_or(Error::Invalid(
+            "LBA 0 has no protective entry and no free slot for one",
+        ))?;
     let at = layout::entry_at(slot);
     out[at..at + layout::ENTRY_SIZE].copy_from_slice(&protective);
     out[510] = 0x55;
     out[511] = 0xAA;
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -1085,6 +1085,50 @@ fn a_mirror_of_a_removed_partition_is_dropped_and_the_marker_stays_in_its_slot()
     );
 }
 
+/// With every legacy slot holding a kept entry and none of them the
+/// marker, there is nowhere to put the protective entry without erasing
+/// one. The commit is refused and LBA 0 is left as it was.
+#[test]
+fn a_full_lba0_with_no_marker_is_refused_not_overwritten() {
+    let (dev, start, length) = hybrid_disk(0, 1);
+    for slot in [0, 2, 3] {
+        plant_mbr_entry(
+            &dev,
+            slot,
+            0x83,
+            (start / 512) as u32,
+            (length / 512) as u32,
+        );
+    }
+    let before = lba0(&dev);
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    assert!(
+        set.reserved.len() == 4 && set.reserved.iter().all(|entry| entry.bytes[4] != 0xEE),
+        "fixture: four kept entries and no marker, got {:?}",
+        set.reserved
+    );
+    assert!(
+        matches!(set.commit(&dev), Err(partitions::Error::Invalid(_))),
+        "a commit with no slot for the marker must be refused"
+    );
+    assert_eq!(lba0(&dev), before, "a refused commit must not touch LBA 0");
+}
+
+/// `reserved` is public, so a slot past the four is a caller's mistake to
+/// report, not an index to panic on.
+#[test]
+fn a_reserved_entry_past_slot_three_is_refused_on_a_gpt_commit() {
+    let (dev, _, _) = hybrid_disk(0, 1);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let mut entry = set.reserved[0].clone();
+    entry.slot = 4;
+    set.reserved.push(entry);
+    assert!(matches!(
+        set.commit(&dev),
+        Err(partitions::Error::Invalid(_))
+    ));
+}
+
 /// A set built from scratch still writes a bare protective MBR: there was
 /// no LBA 0 to keep.
 #[test]
