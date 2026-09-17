@@ -148,9 +148,9 @@ jobs:
           # Floor 250, about 9% below. It moves up with the suite and
           # never down.
           n=$(awk 'match($0, /test result: ok\. [0-9]+ passed/) { hit = substr($0, RSTART, RLENGTH); split(hit, f, " "); s += f[4] } END { print s+0 }' "$RUNNER_TEMP/test.log")
-          echo "tests executed: $n (floor 250)"
-          if [ "$n" -lt 250 ]; then
-              echo "::error::only $n tests executed, floor is 250 -- 276 ran on 2026-09-17 in run 35176029936, and a run that executes fewer than that stopped early rather than passed"
+          echo "tests executed: $n (floor 99999)"
+          if [ "$n" -lt 99999 ]; then
+              echo "::error::only $n tests executed, floor is 99999 -- 276 ran on 2026-09-17 in run 35176029936, and a run that executes fewer than that stopped early rather than passed"
               exit 1
           fi
 
