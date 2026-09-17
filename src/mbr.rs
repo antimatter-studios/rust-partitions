@@ -322,6 +322,31 @@ pub fn reserved_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Vec<ReservedEn
     out
 }
 
+/// Every non-empty entry of a GPT disk's LBA 0, with its slot: the `0xEE`
+/// marker, and on a hybrid disk the entries mirrored from the GPT.
+///
+/// Empty when the sector carries no `0x55AA` signature, since then there
+/// is no MBR there to keep. See `PartitionSet::reserved`.
+pub fn lba0_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Vec<ReservedEntry> {
+    if lba0[510..512] != [0x55, 0xAA] {
+        return Vec::new();
+    }
+    (0..layout::ENTRY_COUNT)
+        .filter_map(|i| {
+            let off = layout::entry_at(i);
+            if lba0[off + layout::TYPE_BYTE] == types::EMPTY {
+                return None;
+            }
+            let mut bytes = [0u8; layout::ENTRY_SIZE];
+            bytes.copy_from_slice(&lba0[off..off + layout::ENTRY_SIZE]);
+            Some(ReservedEntry {
+                slot: i as u32,
+                bytes,
+            })
+        })
+        .collect()
+}
+
 /// Write a fresh MBR sector with up to four primary entries. The bootloader
 /// region (offset 0..446) is zeroed — there is no provision for preserving
 /// existing boot code. A future `with_boot_code` variant can carry caller-

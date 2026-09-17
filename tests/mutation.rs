@@ -999,6 +999,110 @@ fn a_commit_that_changed_nothing_keeps_a_hybrid_mbrs_marker() {
     );
 }
 
+/// A REAL hybrid: a GPT, with a partition mirrored into LBA 0 and boot
+/// code in front of the table (#66, #82).
+///
+/// The test above plants MBR entries on a disk with no GPT header, so the
+/// probe calls it MBR and it never reaches the GPT branch, where LBA 0
+/// was replaced by a bare protective MBR on every commit.
+fn hybrid_disk(marker_slot: usize, mirror_slot: usize) -> (MemDev, u64, u64) {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    let idx = set
+        .add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    let (start, length) = (set.partitions[idx].start, set.partitions[idx].length);
+    set.commit(&dev).unwrap();
+    {
+        let mut b = dev.0.lock().unwrap();
+        let protective: Vec<u8> = b[446..462].to_vec();
+        b[446..510].fill(0);
+        let at = 446 + marker_slot * 16;
+        b[at..at + 16].copy_from_slice(&protective);
+        for (i, byte) in b[..440].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(7) | 1;
+        }
+    }
+    plant_mbr_entry(
+        &dev,
+        mirror_slot,
+        0x83,
+        (start / 512) as u32,
+        (length / 512) as u32,
+    );
+    assert_eq!(
+        partitions::probe(&dev).unwrap().0,
+        TableKind::Gpt,
+        "fixture: the disk must probe as GPT, or this tests the MBR path again"
+    );
+    (dev, start, length)
+}
+
+fn lba0(dev: &MemDev) -> [u8; 512] {
+    let mut out = [0u8; 512];
+    dev.read_at(0, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn an_unchanged_commit_keeps_a_hybrids_mirrored_entries_and_boot_code() {
+    for (marker_slot, mirror_slot) in [(0, 1), (3, 0)] {
+        let (dev, _, _) = hybrid_disk(marker_slot, mirror_slot);
+        let before = lba0(&dev);
+        PartitionSet::from_probe(&dev)
+            .unwrap()
+            .commit(&dev)
+            .unwrap();
+        let after = lba0(&dev);
+        assert!(
+            after[..446] == before[..446],
+            "marker in slot {marker_slot}: the boot code and disk signature were not kept"
+        );
+        assert_eq!(
+            after[446..512],
+            before[446..512],
+            "marker in slot {marker_slot}, mirror in slot {mirror_slot}: an unchanged \
+             commit rewrote the table"
+        );
+    }
+}
+
+/// A mirror describes a GPT partition; once that partition is gone the
+/// mirror would describe free space, so it is dropped, and the marker
+/// stays where it was without a second one appearing.
+#[test]
+fn a_mirror_of_a_removed_partition_is_dropped_and_the_marker_stays_in_its_slot() {
+    let (dev, _, _) = hybrid_disk(2, 0);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.partitions.clear();
+    set.commit(&dev).unwrap();
+    let after = lba0(&dev);
+    let types: Vec<u8> = (0..4).map(|i| after[446 + i * 16 + 4]).collect();
+    assert_eq!(
+        types,
+        vec![0x00, 0x00, 0xEE, 0x00],
+        "the mirror must go and the marker must stay in slot 2, once"
+    );
+}
+
+/// A set built from scratch still writes a bare protective MBR: there was
+/// no LBA 0 to keep.
+#[test]
+fn a_new_gpt_still_writes_a_bare_protective_mbr() {
+    let dev = MemDev::new(DISK_64M as usize);
+    {
+        let mut b = dev.0.lock().unwrap();
+        b[..440].fill(0x5A);
+    }
+    PartitionSet::empty_gpt(DISK_64M).commit(&dev).unwrap();
+    let after = lba0(&dev);
+    assert!(
+        after[..446].iter().all(|&b| b == 0),
+        "a fresh table keeps no boot code"
+    );
+    assert_eq!(after[446 + 4], 0xEE);
+}
+
 /// An entry `parse` skipped as junk is still not this crate's to erase.
 ///
 /// A type byte that says "volume" with a sector count of zero describes

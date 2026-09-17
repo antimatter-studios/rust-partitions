@@ -8,6 +8,15 @@ never does.
 
 ### Fixed
 
+- **A GPT commit keeps a hybrid disk's MBR.** A hybrid (a GPT with
+  partitions mirrored into LBA 0, as Boot Camp and isohybrid images carry)
+  was probed as GPT, and every commit -- including one that changed
+  nothing -- replaced LBA 0 with a bare protective MBR, erasing the
+  mirrored entries and the boot code. `from_probe` now records LBA 0's
+  entries for a GPT set, and the writer keeps the boot code and each
+  mirror whose partition is still written, and puts the `0xEE` marker back
+  in the slot it came from. A set built from scratch still writes a bare
+  protective MBR (#66, #82).
 - **A new partition is not placed over an MBR extended container.** `add`,
   `find_free`, `resize` and the MBR writer's overlap pass walked only the
   volumes, and the container is a preserved entry, so `add` placed a
