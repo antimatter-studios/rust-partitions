@@ -174,13 +174,46 @@ const FOUR_K_LBA1: u64 = 4096;
 /// Returns the message rather than a bool so the reason travels with
 /// the refusal.
 fn looks_like_4kn_gpt(dev: &dyn BlockRead) -> Option<&'static str> {
-    let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
-    dev.read_at(FOUR_K_LBA1, &mut sector).ok()?;
-    let header = gpt::parse_header(&sector).ok()?;
+    // The whole 4096-byte LBA, not a 512-byte sector of it: a header there
+    // may declare a `header_size` up to its block (#75).
+    let mut block = [0u8; 4096];
+    dev.read_at(FOUR_K_LBA1, &mut block).ok()?;
+    let header = gpt::parse_header_block(&block).ok()?;
     if header.my_lba != 1 {
         return None;
     }
     Some("this disk keeps its GPT at byte 4096, so its logical sectors are 4096 bytes (4Kn); this crate reads partition tables in 512-byte units only")
+}
+
+/// The backup GPT's partitions when it parses, or `primary` -- the error
+/// that sent the probe here -- when it does not.
+fn recover_from_backup(
+    dev: &dyn BlockRead,
+    primary: Error,
+) -> Result<(TableKind, Vec<Partition>, TableSource)> {
+    match gpt::parse_backup(dev) {
+        Ok(parts) => Ok((TableKind::Gpt, parts, TableSource::RecoveredFromBackup)),
+        Err(_) => Err(primary),
+    }
+}
+
+/// Which copy of the partition table [`probe_with_status`] read, and what
+/// the other copy says (#30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSource {
+    /// An MBR, which has no second copy to consult.
+    Mbr,
+    /// The primary GPT, and the backup at the end of the disk describes
+    /// the same table.
+    Primary,
+    /// The primary GPT, but the backup is missing, damaged, or describes a
+    /// different table: the reason is [`gpt::validate_backup`]'s. The next
+    /// tool to read this disk may believe the backup instead.
+    PrimaryBackupStale(&'static str),
+    /// The primary GPT could not be read, and these are the backup's
+    /// partitions. The disk's two copies disagree, so a caller should not
+    /// act on the table -- above all, write it -- without saying so.
+    RecoveredFromBackup,
 }
 
 /// Probe the device. Returns `(table_kind, partitions)` on success.
@@ -191,7 +224,34 @@ fn looks_like_4kn_gpt(dev: &dyn BlockRead) -> Option<&'static str> {
 ///  2. MBR at LBA 0. The protective-MBR case (single 0xEE entry) means GPT
 ///     was supposed to be there but its parse failed — propagate the GPT
 ///     error rather than reporting a single GPT-protective MBR partition.
+///
+/// Never reads the backup GPT: a damaged primary is an error here. Use
+/// [`probe_with_status`] to fall back to the backup, and to learn whether
+/// the backup agrees.
 pub fn probe(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>)> {
+    probe_inner(dev, false).map(|(kind, parts, _)| (kind, parts))
+}
+
+/// [`probe`], consulting the backup GPT and saying which copy the
+/// partitions came from (#30).
+///
+/// A primary that does not parse -- a bad header or entry-array CRC, a
+/// header out of range, or a missing signature behind a protective MBR --
+/// falls back to the backup, and the result is
+/// [`TableSource::RecoveredFromBackup`]; the primary's error is returned
+/// only when the backup does not parse either. A primary that parses is
+/// checked against the backup, and a disagreement is
+/// [`TableSource::PrimaryBackupStale`]. A fallback that happened silently
+/// would hand a caller a table the disk itself disagrees with, so the
+/// source always travels with the partitions.
+pub fn probe_with_status(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>, TableSource)> {
+    probe_inner(dev, true)
+}
+
+fn probe_inner(
+    dev: &dyn BlockRead,
+    consult_backup: bool,
+) -> Result<(TableKind, Vec<Partition>, TableSource)> {
     // --- LBA 0 + LBA 1: enough to decide which table type ---
     let mut lba0 = [0u8; crate::SECTOR_SIZE_USIZE];
     let mut lba1 = [0u8; crate::SECTOR_SIZE_USIZE];
@@ -221,8 +281,18 @@ pub fn probe(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>)> {
     let has_gpt_sig = gpt_sig == gpt::SIGNATURE;
 
     if has_gpt_sig {
-        let parts = gpt::parse(dev, &lba1)?;
-        return Ok((TableKind::Gpt, parts));
+        return match gpt::parse(dev, &lba1) {
+            Ok(parts) if consult_backup => {
+                let source = match gpt::validate_backup(dev, &parts) {
+                    gpt::BackupStatus::Ok => TableSource::Primary,
+                    gpt::BackupStatus::Mismatch(why) => TableSource::PrimaryBackupStale(why),
+                };
+                Ok((TableKind::Gpt, parts, source))
+            }
+            Ok(parts) => Ok((TableKind::Gpt, parts, TableSource::Primary)),
+            Err(primary) if consult_backup => recover_from_backup(dev, primary),
+            Err(primary) => Err(primary),
+        };
     }
 
     // A 4Kn disk keeps its GPT where 4096-byte LBAs put it.
@@ -261,12 +331,14 @@ pub fn probe(dev: &dyn BlockRead) -> Result<(TableKind, Vec<Partition>)> {
         // the disk *should* be GPT — but GPT signature was missing, so the
         // table is broken. Surface that explicitly.
         if mbr::is_protective(&lba0) {
-            return Err(Error::GptCorrupt(
-                "protective MBR present but no GPT signature",
-            ));
+            let primary = Error::GptCorrupt("protective MBR present but no GPT signature");
+            if consult_backup {
+                return recover_from_backup(dev, primary);
+            }
+            return Err(primary);
         }
         let parts = mbr::parse(&lba0)?;
-        return Ok((TableKind::Mbr, parts));
+        return Ok((TableKind::Mbr, parts, TableSource::Mbr));
     }
 
     Err(Error::NoPartitionTable)

@@ -296,6 +296,20 @@ pub fn mark_overlaps(spans: &[(u64, u64)]) -> Vec<bool> {
 
 /// Parse and CRC-validate a GPT header sector. Does not touch the entry array.
 pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
+    parse_header_block(sector)
+}
+
+/// [`parse_header`] for a header read from a logical block of any size.
+///
+/// `header_size` may be anything from 92 up to the block it sits in. The
+/// header's own logical block is the limit the specification sets, so on a
+/// 4Kn disk that is 4096, and a header there declaring more than 512 is
+/// legal; read through a 512-byte buffer it was refused as out of range and
+/// the disk misreported as corrupt (#75).
+pub(crate) fn parse_header_block(sector: &[u8]) -> Result<Header> {
+    if sector.len() < SECTOR_SIZE as usize {
+        return Err(Error::GptCorrupt("header block shorter than a sector"));
+    }
     if &sector[header_offsets::SIGNATURE..header_offsets::SIGNATURE + 8] != SIGNATURE {
         return Err(Error::GptCorrupt("missing EFI PART signature"));
     }
@@ -304,7 +318,7 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
             .try_into()
             .unwrap(),
     );
-    if !(92..=SECTOR_SIZE as u32).contains(&header_size) {
+    if !(92..=sector.len() as u64).contains(&u64::from(header_size)) {
         return Err(Error::GptCorrupt("header_size out of range"));
     }
 
@@ -313,8 +327,7 @@ pub fn parse_header(sector: &[u8; crate::SECTOR_SIZE_USIZE]) -> Result<Header> {
             .try_into()
             .unwrap(),
     );
-    let mut header_for_crc = [0u8; crate::SECTOR_SIZE_USIZE];
-    header_for_crc[..header_size as usize].copy_from_slice(&sector[..header_size as usize]);
+    let mut header_for_crc = sector[..header_size as usize].to_vec();
     header_for_crc[header_offsets::HEADER_CRC32..header_offsets::HEADER_CRC32 + 4].fill(0);
     let computed_header_crc = crc32fast::hash(&header_for_crc[..header_size as usize]);
     if computed_header_crc != stored_header_crc {

@@ -2322,3 +2322,161 @@ fn plant_entry_uuid(dev: &MemDev, slot: usize, uuid: [u8; 16]) {
     header[16..20].copy_from_slice(&crc.to_le_bytes());
     dev.write_at(512, &header).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// probe_with_status: the backup GPT is consulted, and says so (#30)
+// ---------------------------------------------------------------------------
+
+/// A two-partition GPT on a 64 MiB disk, and its partitions (see
+/// [`sorted`]).
+fn two_partition_gpt() -> (MemDev, String) {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    set.add(
+        None,
+        8 * ONE_MIB,
+        PartitionTypeId::EfiSystem,
+        Some("EFI".into()),
+    )
+    .unwrap();
+    set.add(
+        None,
+        16 * ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        Some("root".into()),
+    )
+    .unwrap();
+    set.commit(&dev).unwrap();
+    let (_, parts) = probe(&dev).unwrap();
+    assert_eq!(parts.len(), 2, "fixture");
+    (dev, sorted(parts))
+}
+
+fn flip(dev: &MemDev, at: u64) {
+    let mut b = [0u8; 1];
+    dev.read_at(at, &mut b).unwrap();
+    b[0] ^= 0xFF;
+    dev.write_at(at, &b).unwrap();
+}
+
+/// Every field of every partition, sorted by start, as one comparable
+/// string: `Partition` is not `PartialEq`.
+fn sorted(mut parts: Vec<Partition>) -> String {
+    parts.sort_by_key(|p| p.start);
+    format!("{parts:?}")
+}
+
+#[test]
+fn an_intact_gpt_is_read_from_the_primary_with_the_backup_agreeing() {
+    let (dev, before) = two_partition_gpt();
+    let (kind, parts, source) = partitions::probe_with_status(&dev).unwrap();
+    assert_eq!(
+        (kind, source),
+        (TableKind::Gpt, partitions::TableSource::Primary)
+    );
+    assert_eq!(sorted(parts), before);
+}
+
+/// The most common way to lose a table -- the first sectors overwritten --
+/// still leaves the backup, which gdisk, parted and Linux all fall back
+/// to. `probe` keeps its error; `probe_with_status` recovers and says so.
+#[test]
+fn a_damaged_primary_is_recovered_from_the_backup_and_reported() {
+    for (what, damage) in [("header CRC", 512 + 16), ("entry array", 2 * 512 + 40)] {
+        let (dev, before) = two_partition_gpt();
+        flip(&dev, damage);
+        assert!(
+            probe(&dev).is_err(),
+            "{what}: probe must still refuse the primary"
+        );
+        let (kind, parts, source) = partitions::probe_with_status(&dev)
+            .unwrap_or_else(|e| panic!("{what}: the backup was not used: {e}"));
+        assert_eq!(kind, TableKind::Gpt);
+        assert_eq!(
+            source,
+            partitions::TableSource::RecoveredFromBackup,
+            "{what}"
+        );
+        assert_eq!(sorted(parts), before, "{what}: the backup's partitions");
+    }
+
+    // The primary header gone altogether, behind its protective MBR.
+    let (dev, before) = two_partition_gpt();
+    dev.write_at(512, &[0u8; 512]).unwrap();
+    let (_, parts, source) = partitions::probe_with_status(&dev).unwrap();
+    assert_eq!(source, partitions::TableSource::RecoveredFromBackup);
+    assert_eq!(sorted(parts), before);
+}
+
+/// A primary that parses over a backup that does not match is reported,
+/// not passed off as healthy.
+#[test]
+fn a_stale_or_destroyed_backup_is_reported_beside_the_primary() {
+    let (dev, before) = two_partition_gpt();
+    let last_lba = dev.size_bytes() / 512 - 1;
+    dev.write_at((last_lba - 32) * 512, &vec![0u8; 33 * 512])
+        .unwrap();
+    let (_, parts, source) = partitions::probe_with_status(&dev).unwrap();
+    assert!(
+        matches!(source, partitions::TableSource::PrimaryBackupStale(_)),
+        "a destroyed backup was reported as {source:?}"
+    );
+    assert_eq!(sorted(parts), before, "the primary's partitions");
+}
+
+/// With both copies damaged there is nothing to recover, and the error
+/// is the primary's.
+#[test]
+fn both_copies_damaged_is_the_primarys_error() {
+    let (dev, _) = two_partition_gpt();
+    flip(&dev, 512 + 16);
+    let last_lba = dev.size_bytes() / 512 - 1;
+    flip(&dev, last_lba * 512 + 16);
+    assert!(matches!(
+        partitions::probe_with_status(&dev),
+        Err(Error::GptHeaderCrc)
+    ));
+}
+
+#[test]
+fn an_mbr_disk_reports_its_source_as_mbr() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_mbr(DISK_64M);
+    set.add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    set.commit(&dev).unwrap();
+    let (kind, _, source) = partitions::probe_with_status(&dev).unwrap();
+    assert_eq!(
+        (kind, source),
+        (TableKind::Mbr, partitions::TableSource::Mbr)
+    );
+}
+
+/// The C ABI probes with the backup consulted and hands the source over.
+#[test]
+fn the_c_abi_recovers_from_the_backup_and_reports_the_source() {
+    use partitions::capi::*;
+    use std::sync::Arc;
+
+    let (dev, _) = two_partition_gpt();
+    flip(&dev, 512 + 16);
+    let handle = fs_core::ffi::FsCoreDevice::into_handle(Arc::new(dev));
+    let mut list: *mut PartitionList = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            partitions_probe(handle, &mut list),
+            fs_core::ffi::FsCoreErrorCode::Ok
+        );
+        assert_eq!(partitions_count(list), 2);
+        assert_eq!(
+            partitions_table_source(list),
+            TableSourceCode::GptRecoveredFromBackup as i32
+        );
+        partitions_list_free(list);
+        assert_eq!(
+            partitions_table_source(std::ptr::null()),
+            TableSourceCode::None as i32
+        );
+        fs_core::ffi::fs_core_device_close(handle);
+    }
+}

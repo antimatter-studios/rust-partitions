@@ -6,6 +6,18 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **The backup GPT is consulted, and the caller is told.** `probe_with_status`
+  returns the table kind, the partitions and a `TableSource`: the primary with
+  the backup agreeing, the primary with a stale or damaged backup, or
+  partitions recovered from the backup because the primary could not be read.
+  A disk whose first sectors were overwritten read as unpartitioned, where
+  gdisk, parted and Linux recover it, and a stale backup was never reported.
+  `probe` is unchanged. The C ABI's `partitions_probe` now probes this way,
+  and `partitions_table_source` returns the source as
+  `PartitionsTableSource` (#30).
+
 ### Fixed
 
 - **`probe` reads LBA 1 instead of guessing from the device size.** A
@@ -15,6 +27,12 @@ never does.
   bound refused it too. LBA 1 is now read, and only a read past the end,
   or a device that stated its small size, means there is none; a size of
   0 no longer bounds the entry array (#37).
+- **A 4Kn GPT header larger than 512 bytes is still recognised as 4Kn.**
+  The 4Kn check read a 512-byte sector at byte 4096 and `parse_header`
+  capped `header_size` at 512, while a header may fill its 4096-byte
+  logical block. Such a disk was reported as a corrupt table instead of
+  refused by its sector size. The check now reads the whole block and
+  accepts a `header_size` up to it (#75).
 - **A GPT commit keeps a hybrid disk's MBR.** A hybrid (a GPT with
   partitions mirrored into LBA 0, as Boot Camp and isohybrid images carry)
   was probed as GPT, and every commit -- including one that changed
