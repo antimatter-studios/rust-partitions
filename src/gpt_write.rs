@@ -311,18 +311,24 @@ pub fn write_gpt_preserving_tails(
     geometry: GptGeometry,
     tails: &gpt::EntryTails,
 ) -> Result<()> {
-    write_gpt_assigning_slots(dev, partitions, disk_guid, geometry, tails).map(|_| ())
+    write_gpt_assigning_slots(dev, partitions, disk_guid, geometry, tails, &[]).map(|_| ())
 }
 
 /// As [`write_gpt_preserving_tails`], returning the table slot each
 /// partition was written into, in `partitions` order — the slots
 /// [`assign_slots`] gave them, not a second derivation of them.
+///
+/// `lba0` is what the disk's LBA 0 held when the set was probed (see
+/// `PartitionSet::reserved`). Empty writes a bare protective MBR, as
+/// before; otherwise LBA 0 keeps its boot code and its mirrored entries
+/// ([`hybrid_lba0`]).
 pub(crate) fn write_gpt_assigning_slots(
     dev: &dyn BlockDevice,
     partitions: &[Partition],
     disk_guid: [u8; 16],
     geometry: GptGeometry,
     tails: &gpt::EntryTails,
+    lba0: &[crate::mbr::ReservedEntry],
 ) -> Result<Vec<u32>> {
     if !dev.is_writable() {
         return Err(Error::Block(fs_core::Error::ReadOnly));
@@ -438,6 +444,12 @@ pub(crate) fn write_gpt_assigning_slots(
     // boot signature
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
+    if !lba0.is_empty() {
+        let mut current = [0u8; crate::SECTOR_SIZE_USIZE];
+        dev.read_at(0, &mut current)?;
+        let protective: [u8; 16] = mbr[446..462].try_into().expect("sixteen bytes");
+        mbr = hybrid_lba0(&current, lba0, protective, partitions)?;
+    }
     dev.write_at(0, &mbr)?;
 
     // --- Primary header at LBA 1. ---
@@ -610,6 +622,82 @@ fn build_header(
     let header_crc = crc32fast::hash(&h[..HEADER_SIZE as usize]);
     h[16..20].copy_from_slice(&header_crc.to_le_bytes());
     h
+}
+
+/// LBA 0 for a GPT commit onto a disk whose LBA 0 held `lba0` (#66).
+///
+/// A hybrid disk mirrors some GPT partitions into its MBR, and carries
+/// boot code; writing a bare protective MBR erased both on a commit that
+/// changed nothing. So `current`'s bytes 0..446 -- boot code and disk
+/// signature -- are kept, and so is each entry of `lba0`, in its own slot,
+/// except:
+///
+/// - a mirror (a volume entry with sectors) whose range no longer matches
+///   a partition being written, which would describe space the GPT no
+///   longer gives it;
+/// - the `0xEE` marker, which is replaced by `protective` -- the span the
+///   GPT now has -- IN THE SLOT THE OLD ONE OCCUPIED, since a hybrid's
+///   marker need not be in slot 0, and a first free slot when there was
+///   none.
+///
+/// Refused, before anything is written: an entry whose slot is not one of
+/// the four (`reserved` is public), and a table with no marker and no
+/// free slot, where placing the marker would overwrite a kept entry.
+fn hybrid_lba0(
+    current: &[u8; crate::SECTOR_SIZE_USIZE],
+    lba0: &[crate::mbr::ReservedEntry],
+    protective: [u8; 16],
+    partitions: &[Partition],
+) -> Result<[u8; crate::SECTOR_SIZE_USIZE]> {
+    use crate::mbr::{entry_role, layout, types, EntryRole};
+    if lba0
+        .iter()
+        .any(|entry| entry.slot as usize >= layout::ENTRY_COUNT)
+    {
+        return Err(Error::Invalid(
+            "reserved entry slot past the end of the table",
+        ));
+    }
+    let mut out = [0u8; crate::SECTOR_SIZE_USIZE];
+    out[..layout::TABLE_START].copy_from_slice(&current[..layout::TABLE_START]);
+    let field = |bytes: &[u8; 16], at: usize| {
+        u64::from(u32::from_le_bytes(
+            bytes[at..at + 4].try_into().expect("four bytes"),
+        ))
+    };
+    let mut marker_slot = None;
+    for entry in lba0 {
+        let type_byte = entry.bytes[layout::TYPE_BYTE];
+        if type_byte == types::GPT_PROTECTIVE {
+            marker_slot.get_or_insert(entry.slot as usize);
+            continue;
+        }
+        let sectors = field(&entry.bytes, layout::SECTOR_COUNT);
+        if entry_role(type_byte) == EntryRole::Volume && sectors != 0 {
+            let start = field(&entry.bytes, layout::START_LBA) * SECTOR_SIZE;
+            let still_mirrors = partitions
+                .iter()
+                .any(|p| p.start == start && p.length == sectors * SECTOR_SIZE);
+            if !still_mirrors {
+                continue;
+            }
+        }
+        let at = layout::entry_at(entry.slot as usize);
+        out[at..at + layout::ENTRY_SIZE].copy_from_slice(&entry.bytes);
+    }
+    let slot = marker_slot
+        .or_else(|| {
+            (0..layout::ENTRY_COUNT)
+                .find(|&i| out[layout::entry_at(i) + layout::TYPE_BYTE] == types::EMPTY)
+        })
+        .ok_or(Error::Invalid(
+            "LBA 0 has no protective entry and no free slot for one",
+        ))?;
+    let at = layout::entry_at(slot);
+    out[at..at + layout::ENTRY_SIZE].copy_from_slice(&protective);
+    out[510] = 0x55;
+    out[511] = 0xAA;
+    Ok(out)
 }
 
 #[cfg(test)]

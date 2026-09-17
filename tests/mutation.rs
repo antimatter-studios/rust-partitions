@@ -999,6 +999,154 @@ fn a_commit_that_changed_nothing_keeps_a_hybrid_mbrs_marker() {
     );
 }
 
+/// A REAL hybrid: a GPT, with a partition mirrored into LBA 0 and boot
+/// code in front of the table (#66, #82).
+///
+/// The test above plants MBR entries on a disk with no GPT header, so the
+/// probe calls it MBR and it never reaches the GPT branch, where LBA 0
+/// was replaced by a bare protective MBR on every commit.
+fn hybrid_disk(marker_slot: usize, mirror_slot: usize) -> (MemDev, u64, u64) {
+    let dev = MemDev::new(DISK_64M as usize);
+    let mut set = PartitionSet::empty_gpt(DISK_64M);
+    let idx = set
+        .add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    let (start, length) = (set.partitions[idx].start, set.partitions[idx].length);
+    set.commit(&dev).unwrap();
+    {
+        let mut b = dev.0.lock().unwrap();
+        let protective: Vec<u8> = b[446..462].to_vec();
+        b[446..510].fill(0);
+        let at = 446 + marker_slot * 16;
+        b[at..at + 16].copy_from_slice(&protective);
+        for (i, byte) in b[..440].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(7) | 1;
+        }
+    }
+    plant_mbr_entry(
+        &dev,
+        mirror_slot,
+        0x83,
+        (start / 512) as u32,
+        (length / 512) as u32,
+    );
+    assert_eq!(
+        partitions::probe(&dev).unwrap().0,
+        TableKind::Gpt,
+        "fixture: the disk must probe as GPT, or this tests the MBR path again"
+    );
+    (dev, start, length)
+}
+
+fn lba0(dev: &MemDev) -> [u8; 512] {
+    let mut out = [0u8; 512];
+    dev.read_at(0, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn an_unchanged_commit_keeps_a_hybrids_mirrored_entries_and_boot_code() {
+    for (marker_slot, mirror_slot) in [(0, 1), (3, 0)] {
+        let (dev, _, _) = hybrid_disk(marker_slot, mirror_slot);
+        let before = lba0(&dev);
+        PartitionSet::from_probe(&dev)
+            .unwrap()
+            .commit(&dev)
+            .unwrap();
+        let after = lba0(&dev);
+        assert!(
+            after[..446] == before[..446],
+            "marker in slot {marker_slot}: the boot code and disk signature were not kept"
+        );
+        assert_eq!(
+            after[446..512],
+            before[446..512],
+            "marker in slot {marker_slot}, mirror in slot {mirror_slot}: an unchanged \
+             commit rewrote the table"
+        );
+    }
+}
+
+/// A mirror describes a GPT partition; once that partition is gone the
+/// mirror would describe free space, so it is dropped, and the marker
+/// stays where it was without a second one appearing.
+#[test]
+fn a_mirror_of_a_removed_partition_is_dropped_and_the_marker_stays_in_its_slot() {
+    let (dev, _, _) = hybrid_disk(2, 0);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.partitions.clear();
+    set.commit(&dev).unwrap();
+    let after = lba0(&dev);
+    let types: Vec<u8> = (0..4).map(|i| after[446 + i * 16 + 4]).collect();
+    assert_eq!(
+        types,
+        vec![0x00, 0x00, 0xEE, 0x00],
+        "the mirror must go and the marker must stay in slot 2, once"
+    );
+}
+
+/// With every legacy slot holding a kept entry and none of them the
+/// marker, there is nowhere to put the protective entry without erasing
+/// one. The commit is refused and LBA 0 is left as it was.
+#[test]
+fn a_full_lba0_with_no_marker_is_refused_not_overwritten() {
+    let (dev, start, length) = hybrid_disk(0, 1);
+    for slot in [0, 2, 3] {
+        plant_mbr_entry(
+            &dev,
+            slot,
+            0x83,
+            (start / 512) as u32,
+            (length / 512) as u32,
+        );
+    }
+    let before = lba0(&dev);
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    assert!(
+        set.reserved.len() == 4 && set.reserved.iter().all(|entry| entry.bytes[4] != 0xEE),
+        "fixture: four kept entries and no marker, got {:?}",
+        set.reserved
+    );
+    assert!(
+        matches!(set.commit(&dev), Err(partitions::Error::Invalid(_))),
+        "a commit with no slot for the marker must be refused"
+    );
+    assert_eq!(lba0(&dev), before, "a refused commit must not touch LBA 0");
+}
+
+/// `reserved` is public, so a slot past the four is a caller's mistake to
+/// report, not an index to panic on.
+#[test]
+fn a_reserved_entry_past_slot_three_is_refused_on_a_gpt_commit() {
+    let (dev, _, _) = hybrid_disk(0, 1);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let mut entry = set.reserved[0];
+    entry.slot = 4;
+    set.reserved.push(entry);
+    assert!(matches!(
+        set.commit(&dev),
+        Err(partitions::Error::Invalid(_))
+    ));
+}
+
+/// A set built from scratch still writes a bare protective MBR: there was
+/// no LBA 0 to keep.
+#[test]
+fn a_new_gpt_still_writes_a_bare_protective_mbr() {
+    let dev = MemDev::new(DISK_64M as usize);
+    {
+        let mut b = dev.0.lock().unwrap();
+        b[..440].fill(0x5A);
+    }
+    PartitionSet::empty_gpt(DISK_64M).commit(&dev).unwrap();
+    let after = lba0(&dev);
+    assert!(
+        after[..446].iter().all(|&b| b == 0),
+        "a fresh table keeps no boot code"
+    );
+    assert_eq!(after[446 + 4], 0xEE);
+}
+
 /// An entry `parse` skipped as junk is still not this crate's to erase.
 ///
 /// A type byte that says "volume" with a sector count of zero describes
@@ -1961,6 +2109,124 @@ fn a_commit_mut_whose_flush_fails_records_no_slots() {
         .unwrap();
     assert!(set.commit_mut(&dev).is_err());
     assert_eq!(set.partitions[0].slot, None);
+}
+
+/// An extended container is a range, and a new partition stays out of it
+/// (#67).
+///
+/// `add`, `find_free` and the writer's overlap pass walked only the
+/// volumes, and the container is a preserved entry rather than a volume,
+/// so nothing checked a new partition against it. Measured before the
+/// fix on this layout: `add` placed the new partition at LBA 4096..12287,
+/// over the container at 8192..24575, and `commit` returned `Ok(())` --
+/// every logical partition chained inside it now inside another
+/// partition's range.
+///
+/// The second layout puts the container BELOW the volume, so a search
+/// that took the ranges in any order but the disk's would try the gap
+/// before the volume first and land in the container.
+#[test]
+fn a_new_partition_is_not_placed_over_an_extended_container() {
+    for (volume, container) in [
+        ((2048u32, 2048u32), (8192u32, 16384u32)),
+        ((16384, 2048), (2048, 8192)),
+    ] {
+        let dev = MemDev::new(DISK_64M as usize);
+        plant_mbr_entry(&dev, 0, 0x83, volume.0, volume.1);
+        plant_mbr_entry(&dev, 1, 0x0F, container.0, container.1);
+        let (c_start, c_end) = (
+            u64::from(container.0),
+            u64::from(container.0 + container.1 - 1),
+        );
+
+        let mut set = PartitionSet::from_probe(&dev).unwrap();
+        let idx = set
+            .add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+            .unwrap_or_else(|e| panic!("container at {c_start}..{c_end}: add refused: {e:?}"));
+        let (start, end) = set.partitions[idx].sector_span().unwrap();
+        assert!(
+            end < c_start || start > c_end,
+            "add placed the new partition at LBA {start}..{end}, over the container at \
+             {c_start}..{c_end}"
+        );
+        set.commit(&dev).unwrap();
+    }
+}
+
+/// The explicit spellings of the same mistake are refused by name: a
+/// start hint inside the container, a resize that grows a volume into
+/// it, and a partition moved over it by hand, which only the writer's
+/// own overlap pass can see.
+#[test]
+fn a_partition_hinted_resized_or_moved_into_an_extended_container_is_refused() {
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0x83, 2048, 2048);
+    plant_mbr_entry(&dev, 1, 0x0F, 8192, 16384);
+    let before = mbr_table(&dev);
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let hinted = set.add(
+        Some(16384 * 512),
+        ONE_MIB,
+        PartitionTypeId::LinuxFilesystem,
+        None,
+    );
+    assert!(
+        matches!(hinted, Err(Error::Invalid(m)) if m.contains("overlaps")),
+        "a hint inside the container gave {hinted:?}"
+    );
+    let resized = set.resize(PartitionRef::Index(0), 8 * ONE_MIB);
+    assert!(
+        matches!(resized, Err(Error::Invalid(m)) if m.contains("overlap")),
+        "a resize into the container gave {resized:?}"
+    );
+
+    let idx = set
+        .add(
+            Some(32 * ONE_MIB),
+            ONE_MIB,
+            PartitionTypeId::LinuxFilesystem,
+            None,
+        )
+        .unwrap();
+    set.partitions[idx].start = 12288 * 512;
+    let committed = set.commit(&dev);
+    assert!(
+        matches!(committed, Err(Error::Invalid(m)) if m.contains("overlap")),
+        "a partition moved over the container was committed: {committed:?}"
+    );
+    assert_eq!(mbr_table(&dev), before, "a refused commit wrote the table");
+}
+
+/// What must NOT count as a range: a `0xEE` marker, which spans the
+/// whole disk by design -- or, on some hybrids, only the GPT's region,
+/// which is why it is exempt by type and not by span -- and an entry
+/// whose sector count is zero, planted at LBA 0 where `start + count - 1`
+/// has nothing to subtract from.
+#[test]
+fn a_protective_marker_or_an_empty_entry_does_not_block_a_new_partition() {
+    let dev = MemDev::new(DISK_64M as usize);
+    let total_sectors = (DISK_64M / 512) as u32;
+    plant_mbr_entry(&dev, 0, 0xEE, 1, total_sectors - 1);
+    plant_mbr_entry(&dev, 1, 0x0F, 0, 0);
+    plant_mbr_entry(&dev, 2, 0x83, 2048, 2048);
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.add(None, 4 * ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .expect("the whole-disk marker and an empty entry claim no range");
+    set.commit(&dev).unwrap();
+
+    // A hybrid whose marker covers only the GPT region, where the new
+    // partition then goes, is exempt the same way.
+    let dev = MemDev::new(DISK_64M as usize);
+    plant_mbr_entry(&dev, 0, 0xEE, 1, 2047);
+    plant_mbr_entry(&dev, 1, 0x83, 8192, 2048);
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    let idx = set
+        .add(Some(512), ONE_MIB, PartitionTypeId::LinuxFilesystem, None)
+        .unwrap();
+    assert_eq!(set.partitions[idx].start, 2048 * 512);
+    set.commit(&dev).unwrap();
 }
 
 /// Tails are keyed by UUID, so two entries sharing one -- which a disk

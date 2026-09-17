@@ -259,6 +259,35 @@ pub struct ReservedEntry {
     pub bytes: [u8; layout::ENTRY_SIZE],
 }
 
+impl ReservedEntry {
+    /// The inclusive LBA range this entry claims, where it claims one a
+    /// new partition must stay out of (#67).
+    ///
+    /// An extended container is a real range: the logical partitions
+    /// chained inside it live there, and a primary placed over it puts
+    /// them inside someone else's partition. Two kinds have none:
+    ///
+    /// - `0xEE`, by TYPE rather than by span. A protective entry covers
+    ///   the whole disk by design, and some hybrid MBRs write one that
+    ///   covers only the GPT's region; a span-based test would get the
+    ///   second wrong.
+    /// - a sector count of zero, which claims nothing. Decoded as a span
+    ///   it would be `(start, start - 1)`, inverted, and an overlap test
+    ///   against it silently answers "no".
+    pub fn span(&self) -> Option<(u64, u64)> {
+        if self.bytes[layout::TYPE_BYTE] == types::GPT_PROTECTIVE {
+            return None;
+        }
+        let field = |at: usize| {
+            u64::from(u32::from_le_bytes(
+                self.bytes[at..at + 4].try_into().expect("four bytes"),
+            ))
+        };
+        let (start, count) = (field(layout::START_LBA), field(layout::SECTOR_COUNT));
+        (count != 0).then(|| (start, start + count - 1))
+    }
+}
+
 /// Every non-empty entry [`parse`] leaves out, with the slot it sits in.
 ///
 /// That is the containers and markers [`entry_role`] names, and also an
@@ -293,6 +322,31 @@ pub fn reserved_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Vec<ReservedEn
     out
 }
 
+/// Every non-empty entry of a GPT disk's LBA 0, with its slot: the `0xEE`
+/// marker, and on a hybrid disk the entries mirrored from the GPT.
+///
+/// Empty when the sector carries no `0x55AA` signature, since then there
+/// is no MBR there to keep. See `PartitionSet::reserved`.
+pub fn lba0_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Vec<ReservedEntry> {
+    if lba0[510..512] != [0x55, 0xAA] {
+        return Vec::new();
+    }
+    (0..layout::ENTRY_COUNT)
+        .filter_map(|i| {
+            let off = layout::entry_at(i);
+            if lba0[off + layout::TYPE_BYTE] == types::EMPTY {
+                return None;
+            }
+            let mut bytes = [0u8; layout::ENTRY_SIZE];
+            bytes.copy_from_slice(&lba0[off..off + layout::ENTRY_SIZE]);
+            Some(ReservedEntry {
+                slot: i as u32,
+                bytes,
+            })
+        })
+        .collect()
+}
+
 /// Write a fresh MBR sector with up to four primary entries. The bootloader
 /// region (offset 0..446) is zeroed — there is no provision for preserving
 /// existing boot code. A future `with_boot_code` variant can carry caller-
@@ -321,12 +375,11 @@ pub fn write_mbr(dev: &dyn BlockDevice, partitions: &[Partition]) -> Result<()> 
 /// success. [`reserved_entries`] produces this list from the sector the
 /// probe read.
 ///
-/// The reserved entries take no part in the overlap check: a `0xEE`
-/// marker spans the whole disk by design and overlaps every real
-/// partition, so checking it against them would refuse every hybrid MBR
-/// there is. They are bytes to be preserved rather than a layout to be
-/// validated — they were on the disk already, and this writer is not
-/// the one that put them there.
+/// A reserved entry with a range -- an extended container -- takes part
+/// in the overlap check: a partition over it is refused (#67). A `0xEE`
+/// marker does not, because it spans the whole disk by design and
+/// overlaps every real partition, and checking it would refuse every
+/// hybrid MBR there is; see [`ReservedEntry::span`].
 pub fn write_mbr_preserving(
     dev: &dyn BlockDevice,
     partitions: &[Partition],
@@ -353,19 +406,18 @@ pub(crate) fn write_mbr_assigning_slots(
         return Err(Error::DeviceTooSmall);
     }
 
-    // Overlap check on a sorted-by-start view.
-    let mut sorted: Vec<&Partition> = partitions.iter().collect();
-    sorted.sort_by_key(|p| p.start);
-    let mut prev_end_lba: Option<u64> = None;
-    for p in &sorted {
+    // Overlap check on a sorted-by-start view, reserved ranges included.
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(partitions.len() + reserved.len());
+    for p in partitions {
         validate_mbr_partition(p, total_bytes)?;
-        let (start_lba, end_lba) = p.sector_span()?;
-        if let Some(prev) = prev_end_lba {
-            if start_lba <= prev {
-                return Err(Error::Invalid("partitions overlap"));
-            }
+        spans.push(p.sector_span()?);
+    }
+    spans.extend(reserved.iter().filter_map(ReservedEntry::span));
+    spans.sort_unstable();
+    for pair in spans.windows(2) {
+        if pair[1].0 <= pair[0].1 {
+            return Err(Error::Invalid("partitions overlap"));
         }
-        prev_end_lba = Some(end_lba);
     }
 
     let taken: Vec<u32> = reserved.iter().map(|r| r.slot).collect();
