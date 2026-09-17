@@ -113,7 +113,7 @@ pub mod sniff;
 
 pub use error::{Error, Result};
 pub use mutation::{PartitionRef, PartitionSet, PartitionTypeId};
-pub use probe::{probe, Partition, PartitionKind, TableKind};
+pub use probe::{probe, probe_with_status, Partition, PartitionKind, TableKind, TableSource};
 pub use sniff::{sniff, FsKind};
 
 // Re-export the core block-device pieces so consumers don't have to depend

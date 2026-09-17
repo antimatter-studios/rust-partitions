@@ -85,6 +85,30 @@ pub enum TableKindCode {
     Mbr = 2,
 }
 
+/// Which copy of the table a list came from: [`crate::TableSource`] for C.
+/// Stable: do not renumber.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSourceCode {
+    /// No list.
+    None = 0,
+    Mbr = 1,
+    GptPrimary = 2,
+    GptPrimaryBackupStale = 3,
+    GptRecoveredFromBackup = 4,
+}
+
+impl From<crate::TableSource> for TableSourceCode {
+    fn from(s: crate::TableSource) -> Self {
+        match s {
+            crate::TableSource::Mbr => TableSourceCode::Mbr,
+            crate::TableSource::Primary => TableSourceCode::GptPrimary,
+            crate::TableSource::PrimaryBackupStale(_) => TableSourceCode::GptPrimaryBackupStale,
+            crate::TableSource::RecoveredFromBackup => TableSourceCode::GptRecoveredFromBackup,
+        }
+    }
+}
+
 impl From<TableKind> for TableKindCode {
     fn from(t: TableKind) -> Self {
         match t {
@@ -182,6 +206,7 @@ const _: () = assert!(align_of::<PartitionInfo>() == 8);
 
 pub struct PartitionList {
     table: TableKindCode,
+    source: TableSourceCode,
     parent: Arc<dyn fs_core::BlockDevice>,
     entries: Vec<PartitionEntry>,
 }
@@ -216,7 +241,7 @@ pub unsafe extern "C" fn partitions_probe(
     let parent_arc: Arc<dyn fs_core::BlockDevice> = unsafe { (*device).inner().clone() };
 
     ffi_guard(|| {
-        let (table, parts) = probe::probe(&*parent_arc).map_err(|e| {
+        let (table, parts, source) = probe::probe_with_status(&*parent_arc).map_err(|e| {
             // Lift partitions::Error to fs_core::Error::Custom for the
             // last-error message. The error code returned to the C
             // caller will be Custom.
@@ -239,6 +264,7 @@ pub unsafe extern "C" fn partitions_probe(
 
         let list = Box::new(PartitionList {
             table: table_code,
+            source: source.into(),
             parent: parent_arc,
             entries,
         });
@@ -256,6 +282,18 @@ pub unsafe extern "C" fn partitions_count(list: *const PartitionList) -> usize {
         return 0;
     }
     unsafe { (*list).entries.len() }
+}
+
+/// Which copy of the table the list came from: one of
+/// `PartitionsTableSource`. A list whose partitions were recovered from
+/// the backup GPT, or whose backup disagrees with its primary, describes
+/// a disk its own two copies disagree about (#30). NULL list returns 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn partitions_table_source(list: *const PartitionList) -> i32 {
+    if list.is_null() {
+        return TableSourceCode::None as i32;
+    }
+    unsafe { (*list).source as i32 }
 }
 
 /// Which on-disk partition table the list came from.
