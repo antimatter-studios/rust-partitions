@@ -1120,7 +1120,7 @@ fn a_full_lba0_with_no_marker_is_refused_not_overwritten() {
 fn a_reserved_entry_past_slot_three_is_refused_on_a_gpt_commit() {
     let (dev, _, _) = hybrid_disk(0, 1);
     let mut set = PartitionSet::from_probe(&dev).unwrap();
-    let mut entry = set.reserved[0].clone();
+    let mut entry = set.reserved[0];
     entry.slot = 4;
     set.reserved.push(entry);
     assert!(matches!(
