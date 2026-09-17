@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A new partition is not placed over an MBR extended container.** `add`,
+  `find_free`, `resize` and the MBR writer's overlap pass walked only the
+  volumes, and the container is a preserved entry, so `add` placed a
+  partition over it and `commit` returned `Ok(())`. `ReservedEntry::span`
+  gives each preserved entry's range -- none for a `0xEE` marker, by type,
+  or an entry with no sectors -- and all four now respect it (#67).
 - **Two GPT entries sharing a UUID no longer trade entry tails on commit.**
   `PartitionSet` keeps each wide entry's tail bytes keyed by UUID, so a
   cloned table with a duplicate UUID kept one tail for both, and a commit
