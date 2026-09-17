@@ -256,8 +256,24 @@ fn probe_inner(
     let mut lba0 = [0u8; crate::SECTOR_SIZE_USIZE];
     let mut lba1 = [0u8; crate::SECTOR_SIZE_USIZE];
     dev.read_at(0, &mut lba0)?;
-    if dev.size_bytes() >= 1024 {
-        dev.read_at(512, &mut lba1)?;
+    // LBA 1 IS READ, NOT INFERRED FROM THE SIZE (#37). A device can say
+    // nothing useful about its size -- `FileDevice` over a raw device node
+    // reports 0, because `stat` does -- and a size test standing in for the
+    // read left `lba1` zeroed and called an intact GPT "protective MBR
+    // present but no GPT signature". A read that runs off the end is what
+    // says there is no LBA 1. A device that states a size below 1024 and
+    // then fails the read some other way (a callback host's refusal) is
+    // taken at its word, as before.
+    if let Err(e) = dev.read_at(512, &mut lba1) {
+        let past_the_end = matches!(
+            e,
+            fs_core::Error::ShortRead { .. } | fs_core::Error::OutOfBounds { .. }
+        );
+        let said_so = (1..1024).contains(&dev.size_bytes());
+        if !(past_the_end || said_so) {
+            return Err(e.into());
+        }
+        lba1 = [0u8; crate::SECTOR_SIZE_USIZE];
     }
 
     let has_mbr_sig = lba0[510] == 0x55 && lba0[511] == 0xAA;

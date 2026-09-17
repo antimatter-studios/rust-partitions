@@ -224,6 +224,63 @@ fn gpt_with_two_partitions() {
     }
 }
 
+/// A device that serves `Bytes` but reports a size of 0, as `FileDevice`
+/// does over a raw device node.
+struct SizeUnknown(Bytes);
+
+impl BlockRead for SizeUnknown {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.0.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        0
+    }
+}
+
+/// An intact GPT behind a device that does not know its size is read, not
+/// reported corrupt (#37). `probe` skipped LBA 1 when the size was under
+/// 1024 and then found no signature in the zeros it never read.
+#[test]
+fn a_gpt_disk_whose_device_reports_no_size_is_read() {
+    let dev = Bytes::new(8 * 1024 * 1024);
+    build_gpt_with_entries(
+        &dev,
+        &[(type_guids::EFI_SYSTEM, [1u8; 16], 34, 2081, "EFI")],
+    );
+    let (kind, parts) = probe(&SizeUnknown(dev)).expect("an intact GPT");
+    assert_eq!(kind, TableKind::Gpt);
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].label.as_deref(), Some("EFI"));
+}
+
+/// A device genuinely too small to hold LBA 1 still probes its MBR: the
+/// read runs off the end and that is the answer, not an error.
+#[test]
+fn an_mbr_image_too_small_for_lba_1_still_probes() {
+    let dev = Bytes::new(600);
+    write_mbr_entry(&dev, 0, 0x83, 2048, 4096);
+    dev.write(510, &[0x55, 0xAA]);
+    let (kind, parts) = probe(&dev).expect("the MBR is read");
+    assert_eq!(kind, TableKind::Mbr);
+    assert_eq!(parts.len(), 1);
+
+    // And through a device that says it is 600 bytes and refuses the
+    // over-read with a plain I/O error, as a callback host does.
+    struct Refuses(Bytes);
+    impl BlockRead for Refuses {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            self.0
+                .read_at(offset, buf)
+                .map_err(|_| fs_core::Error::Io(std::io::Error::other("host refused the read")))
+        }
+        fn size_bytes(&self) -> u64 {
+            self.0.size_bytes()
+        }
+    }
+    let (kind, _) = probe(&Refuses(dev)).expect("a device that stated its size is believed");
+    assert_eq!(kind, TableKind::Mbr);
+}
+
 /// Rewrite fields of the primary header at LBA 1 and restamp both CRCs,
 /// so the only thing wrong with the table is the field under test. A
 /// checksum is not a signature: anyone who can change a field can

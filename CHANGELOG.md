@@ -20,6 +20,13 @@ never does.
 
 ### Fixed
 
+- **`probe` reads LBA 1 instead of guessing from the device size.** A
+  device reporting a size below 1024 bytes -- `FileDevice` over a raw
+  device node reports 0 -- had LBA 1 skipped, so an intact GPT was called
+  "protective MBR present but no GPT signature", and the entry-array
+  bound refused it too. LBA 1 is now read, and only a read past the end,
+  or a device that stated its small size, means there is none; a size of
+  0 no longer bounds the entry array (#37).
 - **A 4Kn GPT header larger than 512 bytes is still recognised as 4Kn.**
   The 4Kn check read a 512-byte sector at byte 4096 and `parse_header`
   capped `header_size` at 512, while a header may fill its 4096-byte

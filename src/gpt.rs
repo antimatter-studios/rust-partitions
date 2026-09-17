@@ -447,10 +447,16 @@ fn parse_entry_array(dev: &dyn BlockRead, header: &Header) -> Result<(Vec<Partit
     // is also what keeps the allocation above honest: the size fields
     // are bounded (4096 entries of at most 4096 bytes), but 16 MiB per
     // probe of a 4 KiB device is still work nobody asked for.
+    //
+    // A device reporting size 0 has told us nothing (a raw device node
+    // through `FileDevice`, #37), so the bound is skipped for it: the
+    // entry-count and entry-size bounds already cap the allocation, and
+    // the read below fails if the array is not there.
     let array_end = array_offset
         .checked_add(total_array_bytes)
         .ok_or(Error::GptCorrupt("partition entry array overflows"))?;
-    if array_end > dev.size_bytes() {
+    let size = dev.size_bytes();
+    if size != 0 && array_end > size {
         return Err(Error::GptCorrupt(
             "partition entry array reaches past the end of the device",
         ));
