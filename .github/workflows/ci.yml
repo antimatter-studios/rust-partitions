@@ -29,6 +29,12 @@ jobs:
       - name: build
         run: cargo build --locked --all-targets
       - name: test
+        # `shell: bash` IS LOAD BEARING ON THE WINDOWS LEG. The default
+        # shell there is pwsh, which has no `trap ... EXIT` and no
+        # `[ ]`, so the floor below would be a syntax error on a third
+        # of this matrix. ubuntu and macOS already default to bash;
+        # saying it here keeps all three legs running one script.
+        shell: bash
         # EXPECT_OVERFLOW_CHECKS ARMS THE ONE CHECK A TEXT SCAN CANNOT DO.
         # This run has no `--release`, so overflow-checks are on, and it
         # is what makes every arithmetic test in this crate mean anything.
@@ -46,7 +52,57 @@ jobs:
         # variable: tests/ci_profile.rs reads this file and fails if no
         # `cargo test` in it runs without `--release` while setting this.
         # See #86.
-        run: cargo test --locked --all-targets
+        run: |
+          # The output is captured by REDIRECTION AND REPLAYED BY A
+          # TRAP, not by `cargo test | tee`, and the difference is the
+          # whole point of the step. Actions runs a `run:` block as bash
+          # with `-e`, where a pipeline's status is its LAST member's,
+          # so `cargo test ... | tee log` exits 0 with the suite red --
+          # the step would report green while the gate this job exists
+          # to be was blind. tests/ci_profile.rs refuses that spelling
+          # for exactly that reason, and the refusal is correct: a
+          # capture that swallows the result is worse than no capture.
+          # `set +e` around it is refused for the same reason and would
+          # be the same defect. So the suite's status is read by the
+          # shell, unmodified, and the log is a file.
+          trap 'cat "$RUNNER_TEMP/test.log"' EXIT
+          cargo test --locked --all-targets > "$RUNNER_TEMP/test.log" 2>&1
+          # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE. This
+          # job reports green on `0 passed; 0 failed` exactly as loudly
+          # as it does on the whole suite: cargo exits 0 when a filter
+          # selects nothing, when a target list comes out empty, and
+          # when the workspace built no test binaries at all. Nothing in
+          # a pass/fail gate can see the difference, because there is no
+          # failure to see. Only a count can.
+          #
+          # Measured 2026-09-17 on run 35176029936 (main, commit
+          # b9a9d82): 276 executed, identical on all three legs, across
+          # eight binaries (34, 7, 5, 94, 54, 12, 67, 3) and with
+          # `0 filtered out` everywhere. The floor is 250, about 9%
+          # below, so ordinary churn in the suite does not trip it while
+          # the collapse it is aimed at -- a whole binary, or the whole
+          # run, going missing -- does. It moves up with the suite and
+          # never down.
+          #
+          # ONE FLOOR IS ENOUGH HERE ONLY BECAUSE THIS JOB MAKES ONE
+          # SELECTION. There is no `-- --ignored` pass and no `#[ignore]`
+          # in the crate, so every test the job can run is in this
+          # number. Add a second `cargo test` selecting differently and
+          # it needs its own floor: two disjoint selections can empty
+          # independently, and a shared total hides the one that did.
+          #
+          # One `awk` rather than `grep | awk`: the runner's bash has
+          # `pipefail`, so on the one input that matters most -- a log
+          # with no `test result:` line in it -- grep exits 1, the
+          # assignment fails, `-e` abandons the step, and the floor
+          # never gets to say what happened. `match`/`RSTART` is POSIX
+          # and behaves the same on the macOS and Windows runners.
+          n=$(awk 'match($0, /test result: ok\. [0-9]+ passed/) { hit = substr($0, RSTART, RLENGTH); split(hit, f, " "); s += f[4] } END { print s+0 }' "$RUNNER_TEMP/test.log")
+          echo "tests executed: $n (floor 250)"
+          if [ "$n" -lt 250 ]; then
+              echo "::error::only $n tests executed, floor is 250 -- 276 ran on 2026-09-17 in run 35176029936, and a run that executes fewer than that stopped early rather than passed"
+              exit 1
+          fi
         env:
           EXPECT_OVERFLOW_CHECKS: "1"
       - name: clippy
@@ -71,7 +127,32 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: test --release
-        run: cargo test --locked --release --all-targets
+        run: |
+          # Captured by redirection and replayed by a trap rather than
+          # piped into `tee`, for the reason spelled out in the debug
+          # job above: under `bash -e` a pipeline's status is its last
+          # member's, and a capture that swallows the suite's result
+          # turns this job green on a red suite.
+          trap 'cat "$RUNNER_TEMP/test.log"' EXIT
+          cargo test --locked --release --all-targets > "$RUNNER_TEMP/test.log" 2>&1
+          # The same floor, and this job has its own because it is its
+          # own selection: the release build produces its own test
+          # binaries, and a release run that collapsed to nothing while
+          # the debug legs stayed whole would be invisible to a count
+          # taken in the other job.
+          #
+          # Measured 2026-09-17 on run 35176029936 (main, commit
+          # b9a9d82), job `test (release)`: 276 executed -- the same
+          # count as the debug legs, which is what makes this a real
+          # second pass over the suite rather than a subset of it.
+          # Floor 250, about 9% below. It moves up with the suite and
+          # never down.
+          n=$(awk 'match($0, /test result: ok\. [0-9]+ passed/) { hit = substr($0, RSTART, RLENGTH); split(hit, f, " "); s += f[4] } END { print s+0 }' "$RUNNER_TEMP/test.log")
+          echo "tests executed: $n (floor 250)"
+          if [ "$n" -lt 250 ]; then
+              echo "::error::only $n tests executed, floor is 250 -- 276 ran on 2026-09-17 in run 35176029936, and a run that executes fewer than that stopped early rather than passed"
+              exit 1
+          fi
 
   fmt:
     name: fmt
