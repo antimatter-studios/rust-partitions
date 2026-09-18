@@ -8,6 +8,18 @@ never does.
 
 ### Added
 
+- **This crate's tables are checked against `sgdisk`, `sfdisk`, `blkid` and
+  `partx`.** `tests/oracle_tools.rs` builds every table shape the crate can
+  write and requires the reference tools to report it field by field -- table
+  type, partition count, start and end LBA, size, type GUID and type byte,
+  unique GUID, name, attributes, disk GUID, and that both GPT headers verify
+  -- then has `sgdisk` and `sfdisk` write tables and requires this crate to
+  read the same values back. 775 field comparisons over nine tests, each with
+  a floor on the number it made, so a parsing change cannot reduce the oracle
+  to nothing. A missing tool fails naming the package that carries it; it
+  never skips. Behind the `oracle` feature, because the macOS and Windows CI
+  legs have none of these tools (#119).
+
 - **The backup GPT is consulted, and the caller is told.** `probe_with_status`
   returns the table kind, the partitions and a `TableSource`: the primary with
   the backup agreeing, the primary with a stale or damaged backup, or
@@ -20,6 +32,38 @@ never does.
 
 ### Fixed
 
+- **An MBR commit keeps the boot code and the disk identifier.**
+  `write_mbr_preserving` built a fresh all-zero sector, so a probe-then-commit
+  that edited nothing zeroed bytes 0..446 of LBA 0: the boot code a BIOS
+  executes, and the 32-bit disk identifier at 440..444 that Linux turns into
+  every `PARTUUID` on the disk. Measured against `sfdisk --dump` on an image
+  it wrote, `label-id: 0xb05958d4` came back `0x00000000` and `blkid` stopped
+  reporting a `PTUUID` at all. The sector now starts as the one on the device,
+  with only the four entries rebuilt; a blank device still reads as zeros, so
+  a table being created is written exactly as before (#101).
+- **An MBR entry whose sectors did not change keeps its CHS bytes.** The
+  writer zeroed the legacy first/last CHS fields of every entry it wrote, so
+  the same unchanged commit rewrote `00 20 21 00 83 41 01 00` as
+  `00 00 00 00 83 00 00 00`. An entry whose start and length are unchanged
+  keeps the CHS pair it came with; a new or moved one still gets zeros, which
+  is unchanged behaviour (#101).
+- **The protective MBR's ending CHS is the disk's last block, not always
+  `FF FF FF`.** The UEFI specification asks for the CHS address of the last
+  logical block, and `FF FF FF` only when that cannot be represented; this
+  crate wrote `FF FF FF` on every disk. Measured against `sgdisk` 1.0.10 on
+  the same images, byte for byte: 8 MiB `05 04 01`, 64 MiB `28 20 08`,
+  512 MiB `45 04 41`, and `FF FF FF` only from about 7.8 GiB up, where the
+  cylinder passes the ten bits a CHS address has. `mbr::chs_for_lba` is the
+  conversion, in the 255x63 geometry every tool assumes (#119).
+- **A GPT commit keeps a hybrid disk's narrow `0xEE` marker.** #66 kept the
+  mirrored entries and the boot code but still rebuilt the marker from the
+  device's size, so a commit that changed nothing widened `sgdisk -h`'s
+  marker over LBA 1..2047 into one over the whole disk -- swallowing the
+  mirrored entry beside it, which is a malformed hybrid MBR rather than a
+  hybrid one. A hybrid LBA 0 now keeps its marker byte for byte, like every
+  other entry there. A bare protective MBR is still rebuilt from the device's
+  size, so a resized image does not keep a stale marker and earn `sfdisk`'s
+  `GPT PMBR size mismatch` (#119).
 - **`probe` reads LBA 1 instead of guessing from the device size.** A
   device reporting a size below 1024 bytes -- `FileDevice` over a raw
   device node reports 0 -- had LBA 1 skipped, so an intact GPT was called

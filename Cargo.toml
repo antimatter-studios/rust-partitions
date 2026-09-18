@@ -33,8 +33,40 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 # reaches a consumer of this crate. Same version as the siblings, so the
 # copies of this guard stay one answer rather than several.
 saphyr = "0.0.12"
+# JSON parser for the external-tool oracle, which reads `sfdisk --json`.
+# sfdisk's own output is the reference description of a partition table,
+# and parsing it by hand -- the shape blk-probe emits JSON with -- would
+# put a second parser of somebody else's format in the position of
+# deciding whether this crate is right. Dev-only, and the same version
+# the siblings rust-img-vhdx and rust-img-qcow2 already carry.
+serde_json = "1"
 tempfile = "3"
 toml = "1.1.5"
+
+# THE ORACLE IS BEHIND A FEATURE BECAUSE IT NEEDS TOOLS THE MATRIX
+# DOES NOT HAVE.
+#
+# `tests/oracle_tools.rs` runs sgdisk, sfdisk, blkid and partx and
+# refuses to skip when they are absent (see tests/common/mod.rs). That
+# refusal is the point of the suite and it is also why the target cannot
+# be in the default selection: `test / macos-latest` and
+# `test / windows-latest` have none of those tools, so `cargo test
+# --all-targets` there would fail on a machine that was never asked to
+# carry them.
+#
+# `required-features` is how cargo is told, rather than a `cfg` inside
+# the file: a `cfg(target_os = "linux")` would leave the target in the
+# selection and silently compile to an empty binary elsewhere, which is
+# a skip wearing a different hat. With the feature off the target is not
+# built at all, and the one job that sets it -- `oracle (external
+# tools)` in .github/workflows/ci.yml, which apt-installs gdisk and
+# util-linux first -- runs every test in it or fails.
+[features]
+oracle = []
+
+[[test]]
+name = "oracle_tools"
+required-features = ["oracle"]
 
 [profile.release]
 lto = true

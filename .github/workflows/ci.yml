@@ -75,14 +75,22 @@ jobs:
           # a pass/fail gate can see the difference, because there is no
           # failure to see. Only a count can.
           #
-          # Measured 2026-09-17 on run 35176029936 (main, commit
-          # b9a9d82): 276 executed, identical on all three legs, across
-          # eight binaries (34, 7, 5, 94, 54, 12, 67, 3) and with
-          # `0 filtered out` everywhere. The floor is 250, about 9%
-          # below, so ordinary churn in the suite does not trip it while
-          # the collapse it is aimed at -- a whole binary, or the whole
-          # run, going missing -- does. It moves up with the suite and
-          # never down.
+          # Measured 2026-09-18 on the branch for #119: 284 executed,
+          # across eight binaries (37, 7, 5, 94, 54, 12, 72, 3) and with
+          # `0 filtered out` everywhere. That is 276 (run 35176029936,
+          # main, b9a9d82) plus the eight regression tests the external
+          # -tool oracle's findings brought with them -- restated as
+          # ordinary tests so they run on macOS and Windows too, where
+          # the oracle cannot. The floor is 258, about 9% below, so
+          # ordinary churn in the suite does not trip it while the
+          # collapse it is aimed at -- a whole binary, or the whole run,
+          # going missing -- does. It moves up with the suite and never
+          # down.
+          #
+          # The `oracle (external tools)` job's own tests are NOT in
+          # this number: their target carries `required-features =
+          # ["oracle"]`, so `--all-targets` here does not build it. That
+          # job counts its own.
           #
           # ONE FLOOR IS ENOUGH HERE ONLY BECAUSE THIS JOB MAKES ONE
           # SELECTION. There is no `-- --ignored` pass and no `#[ignore]`
@@ -98,9 +106,9 @@ jobs:
           # never gets to say what happened. `match`/`RSTART` is POSIX
           # and behaves the same on the macOS and Windows runners.
           n=$(awk 'match($0, /test result: ok\. [0-9]+ passed/) { hit = substr($0, RSTART, RLENGTH); split(hit, f, " "); s += f[4] } END { print s+0 }' "$RUNNER_TEMP/test.log")
-          echo "tests executed: $n (floor 250)"
-          if [ "$n" -lt 250 ]; then
-              echo "::error::only $n tests executed, floor is 250 -- 276 ran on 2026-09-17 in run 35176029936, and a run that executes fewer than that stopped early rather than passed"
+          echo "tests executed: $n (floor 258)"
+          if [ "$n" -lt 258 ]; then
+              echo "::error::only $n tests executed, floor is 258 -- 284 ran on 2026-09-18, and a run that executes fewer than that stopped early rather than passed"
               exit 1
           fi
         env:
@@ -141,18 +149,121 @@ jobs:
           # the debug legs stayed whole would be invisible to a count
           # taken in the other job.
           #
-          # Measured 2026-09-17 on run 35176029936 (main, commit
-          # b9a9d82), job `test (release)`: 276 executed -- the same
-          # count as the debug legs, which is what makes this a real
-          # second pass over the suite rather than a subset of it.
-          # Floor 250, about 9% below. It moves up with the suite and
+          # Measured 2026-09-18 on the branch for #119: 284 executed --
+          # the same count as the debug legs, which is what makes this a
+          # real second pass over the suite rather than a subset of it.
+          # Floor 258, about 9% below. It moves up with the suite and
           # never down.
           n=$(awk 'match($0, /test result: ok\. [0-9]+ passed/) { hit = substr($0, RSTART, RLENGTH); split(hit, f, " "); s += f[4] } END { print s+0 }' "$RUNNER_TEMP/test.log")
-          echo "tests executed: $n (floor 250)"
-          if [ "$n" -lt 250 ]; then
-              echo "::error::only $n tests executed, floor is 250 -- 276 ran on 2026-09-17 in run 35176029936, and a run that executes fewer than that stopped early rather than passed"
+          echo "tests executed: $n (floor 258)"
+          if [ "$n" -lt 258 ]; then
+              echo "::error::only $n tests executed, floor is 258 -- 284 ran on 2026-09-18, and a run that executes fewer than that stopped early rather than passed"
               exit 1
           fi
+
+  # THE ONLY CHECK IN THIS REPOSITORY THAT IS NOT THIS CRATE MARKING ITS
+  # OWN HOMEWORK.
+  #
+  # `tests/oracle_tools.rs` builds tables with this crate and requires
+  # sgdisk, sfdisk, blkid and partx to report them field by field, then
+  # has sgdisk and sfdisk build tables and requires this crate to read
+  # the same values back. Everything else in `tests/` is the writer
+  # against the reader, which cannot see the failure this crate is most
+  # exposed to: agreeing with itself and disagreeing with the world. See
+  # #119.
+  #
+  # IT IS ITS OWN JOB BECAUSE THE TARGET IS BEHIND A FEATURE. The oracle
+  # refuses to skip when a tool is missing, and `test / macos-latest`
+  # and `test / windows-latest` have none of these tools -- so the
+  # target carries `required-features = ["oracle"]` in Cargo.toml and is
+  # not in `--all-targets` anywhere else. This job is the one place the
+  # feature is on, and it installs the tools first.
+  oracle:
+    name: oracle (external tools)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone am-fs-core sibling
+        shell: bash
+        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `util-linux` (sfdisk, blkid, partx) is already on the runner;
+      # installing it anyway is what makes this step the declaration of
+      # what the suite needs rather than a bet on the image's contents.
+      # `gdisk` (sgdisk) is not there by default.
+      - name: install the reference partitioning tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdisk util-linux
+          sgdisk --version
+          sfdisk --version
+      - name: test the oracle
+        shell: bash
+        run: |
+          # A VERDICT, NOT A TRANSCRIPT. The whole log is kept in a file
+          # and only the tail of it is printed, and only when something
+          # failed; a green run prints the ten summary lines the suite
+          # itself emits and one total. The reason is the one written up
+          # in fs-linux-test-harness's scripts/output-budget.sh: a
+          # passing run that prints hundreds of lines hides the handful
+          # that matter, and every reader pays for it -- a person
+          # scrolling, the log viewer, and an agent working here, which
+          # re-reads its transcript on every step. The oracle makes ~780
+          # field comparisons; a line each would be exactly the failure
+          # mode that document is about. The detail lives in the
+          # assertion message, which names the image, the partition, the
+          # field, our value and the tool's.
+          #
+          # Redirected and replayed by a trap, not piped into `tee`, for
+          # the reason spelled out on the `test` job above: under
+          # `bash -e` a pipeline's status is its last member's, and a
+          # capture that swallows the suite's result turns this job
+          # green on a red suite. The trap re-raises the status it
+          # caught so that stays true.
+          trap 'rc=$?; [ "$rc" -eq 0 ] || { echo "--- last 60 lines of $RUNNER_TEMP/oracle.log ---"; tail -n 60 "$RUNNER_TEMP/oracle.log"; }; exit "$rc"' EXIT
+          # `--nocapture` is what lets the per-test summary lines out;
+          # `--quiet` drops cargo's per-test name lines, so the visible
+          # output of a green run is ten counts and a result line.
+          cargo test --locked --quiet --features oracle --test oracle_tools -- --nocapture > "$RUNNER_TEMP/oracle.log" 2>&1
+          grep -E 'comparisons \(floor|test result:' "$RUNNER_TEMP/oracle.log" || true
+          # TWO FLOORS, AND THIS JOB NEEDS THEM MOST OF ALL. Its whole
+          # subject is a comparison that can quietly stop happening: a
+          # tool whose output format moved, a target that stopped being
+          # built, a feature that stopped being passed. Every one of
+          # those ends in `0 passed; 0 failed`, which cargo exits 0 on.
+          #
+          # The first floor is on tests executed. Measured 2026-09-18 on
+          # this branch: 9 executed. The floor is 9 rather than a
+          # percentage below it, because there are nine tests and each
+          # is a whole direction or a whole table format -- losing any
+          # one is not churn.
+          n=$(awk 'match($0, /test result: ok\. [0-9]+ passed/) { hit = substr($0, RSTART, RLENGTH); split(hit, f, " "); s += f[4] } END { print s+0 }' "$RUNNER_TEMP/oracle.log")
+          if [ "$n" -lt 9 ]; then
+              echo "::error::only $n oracle tests executed, floor is 9 -- 9 ran on 2026-09-18, and a run that executes fewer than that compared this crate against fewer readers than it was asked to"
+              exit 1
+          fi
+          # The second is on FIELD comparisons, summed from the counts
+          # each test prints. Each test already asserts its own floor
+          # (`Comparisons::floor`), so this total cannot silently fall;
+          # it is here because it is the number that says what the job
+          # did, and because it turns the ten separate floors into one
+          # line a reader can check. Measured 2026-09-18: 775.
+          # Floor 700, about 10% below.
+          f=$(awk 'match($0, /: [0-9]+ comparisons \(floor/) { hit = substr($0, RSTART, RLENGTH); split(hit, g, " "); s += g[2] } END { print s+0 }' "$RUNNER_TEMP/oracle.log")
+          echo "oracle: $n tests, $f field comparisons against sgdisk/sfdisk/blkid/partx (floors 9, 700)"
+          if [ "$f" -lt 700 ]; then
+              echo "::error::only $f field comparisons ran, floor is 700 -- 775 ran on 2026-09-18, and a run that compares fewer has stopped finding fields rather than stopped disagreeing"
+              exit 1
+          fi
+      # `--all-targets` in the `test` job does not build the oracle
+      # target, because its feature is off there. This is the only job
+      # that can lint it.
+      - name: clippy
+        run: cargo clippy --locked --features oracle --all-targets -- -D warnings
 
   fmt:
     name: fmt

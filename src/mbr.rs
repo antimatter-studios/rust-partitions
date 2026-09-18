@@ -107,6 +107,69 @@ pub mod types {
     pub const EFI_SYSTEM: u8 = 0xEF;
 }
 
+/// Heads per cylinder in the geometry every tool assumes for a CHS
+/// address it has to invent.
+///
+/// There is no real geometry to read off an image file, and there has
+/// not been one to read off a disk since IDE translation. 255x63 is
+/// what the BIOS INT 13h extensions settled on, what `sgdisk` uses, and
+/// what `fdisk` prints; a different choice produces a different byte
+/// for the same LBA and disagrees with every reader that assumes this
+/// one.
+const CHS_HEADS: u64 = 255;
+
+/// Sectors per track in the same geometry. Sector numbers are
+/// one-based, so the largest is 63 and the smallest is 1.
+const CHS_SECTORS: u64 = 63;
+
+/// The largest cylinder a CHS address can hold: ten bits, split across
+/// two bytes.
+const CHS_MAX_CYLINDER: u64 = 1023;
+
+/// `lba` as the three-byte CHS address an MBR entry carries, or
+/// `FF FF FF` when it does not fit.
+///
+/// # Why this exists rather than a constant
+///
+/// The protective MBR wrote `FF FF FF` unconditionally. The UEFI
+/// specification's protective-MBR record says the ending CHS is "the
+/// CHS address of the last logical block on the disk", and `FF FF FF`
+/// only "if it is not possible to represent the value" -- and it is
+/// possible on every disk below about 7.8 GiB, which is most images and
+/// every one in this repository's tests. Measured against `sgdisk`
+/// 1.0.10 on the same disks, byte for byte:
+///
+/// ```text
+///   8 MiB    sgdisk 05 04 01   this crate (before) FF FF FF
+///   64 MiB   sgdisk 28 20 08   this crate (before) FF FF FF
+///   512 MiB  sgdisk 45 04 41   this crate (before) FF FF FF
+///   8 GiB    sgdisk FF FF FF   this crate (before) FF FF FF
+/// ```
+///
+/// Nothing in Linux reads those bytes, which is why this survived. A
+/// BIOS that boots by CHS does, and so does anyone comparing an image
+/// this crate wrote against one a reference tool wrote -- which is now
+/// something this repository does on every run.
+///
+/// The encoding: head in byte 0, sector (1..=63) in the low six bits of
+/// byte 1 with the cylinder's top two bits above it, and the
+/// cylinder's low eight bits in byte 2.
+pub fn chs_for_lba(lba: u64) -> [u8; 3] {
+    let per_cylinder = CHS_HEADS * CHS_SECTORS;
+    let cylinder = lba / per_cylinder;
+    if cylinder > CHS_MAX_CYLINDER {
+        return [0xFF, 0xFF, 0xFF];
+    }
+    let within = lba % per_cylinder;
+    let head = within / CHS_SECTORS;
+    let sector = within % CHS_SECTORS + 1;
+    [
+        head as u8,
+        (sector as u8) | (((cylinder >> 8) as u8) << 6),
+        (cylinder & 0xFF) as u8,
+    ]
+}
+
 /// True when the MBR is "protective" — exactly one non-empty entry of type
 /// 0xEE. Real GPT lives at LBA 1 in this case.
 pub fn is_protective(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> bool {
@@ -347,11 +410,21 @@ pub fn lba0_entries(lba0: &[u8; crate::SECTOR_SIZE_USIZE]) -> Vec<ReservedEntry>
         .collect()
 }
 
-/// Write a fresh MBR sector with up to four primary entries. The bootloader
-/// region (offset 0..446) is zeroed — there is no provision for preserving
-/// existing boot code. A future `with_boot_code` variant can carry caller-
-/// supplied boot code through. TODO: add that variant when a caller wants
-/// legacy BIOS boot support.
+/// Write the four primary entries onto the device's LBA 0, keeping
+/// everything else the sector holds.
+///
+/// The bootloader region (offset 0..446) is **read from the device and
+/// written back unchanged**: the boot code a BIOS executes, and the
+/// 32-bit disk identifier at 440..444 that Linux turns into every
+/// `PARTUUID` on the disk. It used to be zeroed, which meant a
+/// probe-then-commit that edited nothing renamed every partition on the
+/// disk and unbooted it -- see #101 and the comment in
+/// [`write_mbr_assigning_slots`]. On a blank device that region reads
+/// as zeros, so a table being created is written exactly as before.
+///
+/// A caller that wants specific boot code writes it to the device and
+/// then commits; there is no `with_boot_code` parameter because there
+/// no longer needs to be one.
 ///
 /// Validation:
 /// - At most four partitions (extended chains aren't written here).
@@ -423,7 +496,36 @@ pub(crate) fn write_mbr_assigning_slots(
     let taken: Vec<u32> = reserved.iter().map(|r| r.slot).collect();
     let slots =
         crate::gpt_write::assign_slots_with_taken(partitions, layout::ENTRY_COUNT as u32, &taken)?;
+
+    // THE SECTOR STARTS AS THE ONE THAT IS THERE, NOT AS ZEROS (#101).
+    //
+    // It used to start as zeros, and bytes 0..446 are not this
+    // function's to throw away. They hold the boot code a BIOS
+    // executes, and -- at 440..444 -- the disk identifier Linux turns
+    // into every `PARTUUID` on the disk: `root=PARTUUID=<id>-<NN>` on a
+    // kernel command line, `PARTUUID=` lines in an fstab. Measured on a
+    // 16 MiB image written by `sfdisk`, probed and committed back with
+    // nothing edited: `label-id: 0xb05958d4` became `label-id:
+    // 0x00000000`, and `blkid` stopped reporting a `PTUUID` for the
+    // disk at all. Every name anything had for a partition on it
+    // changed, on a round trip that reported success and changed
+    // nothing else.
+    //
+    // Copying only 440..444 would be the wrong fix and a tempting one:
+    // the boot code in 0..440 is the larger loss, it is equally not
+    // ours, and a disk that came back unbootable from an edit that
+    // changed nothing is the same defect with a worse symptom.
+    //
+    // A blank device reads as zeros, so a table being created is
+    // unaffected -- `empty_mbr` on a fresh image writes exactly what it
+    // wrote before.
     let mut sector = [0u8; crate::SECTOR_SIZE_USIZE];
+    dev.read_at(0, &mut sector)?;
+    let existing = sector;
+    // The entry table itself is rebuilt from the set, so it is cleared:
+    // a slot a partition was removed from must not keep its old entry.
+    sector[layout::TABLE_START..layout::TABLE_START + layout::ENTRY_COUNT * layout::ENTRY_SIZE]
+        .fill(0);
     // The preserved entries go down first, so that a slot collision --
     // which `assign_slots_with_taken` refuses, so this is belt and
     // braces -- would end with the caller's edit on disk rather than
@@ -442,9 +544,35 @@ pub(crate) fn write_mbr_assigning_slots(
         let sectors = (p.length / SECTOR_SIZE) as u32;
 
         sector[off] = if active { STATUS_ACTIVE } else { 0x00 };
-        // CHS first/last left as zeros — modern OSes ignore CHS once LBA is
-        // present, and the legacy fields can't faithfully describe most
-        // modern geometry anyway.
+        // CHS FIRST/LAST: KEPT WHEN THE ENTRY STILL DESCRIBES THE SAME
+        // SECTORS, ZEROS OTHERWISE.
+        //
+        // A CHS pair describes an LBA range, so an entry whose start
+        // and length are unchanged has a CHS pair that is still correct
+        // and was not this crate's to invent or discard. Zeroing it was
+        // the other half of #101: a commit that edited nothing rewrote
+        // `00 20 21 00 83 41 01 00` as `00 00 00 00 83 00 00 00` --
+        // the same partition, with the geometry fields a BIOS reads
+        // blanked.
+        //
+        // A NEW OR MOVED ENTRY STILL GETS ZEROS, which is unchanged
+        // behaviour and deliberate: modern firmware and every OS read
+        // the LBA fields, the legacy ones cannot describe most modern
+        // geometry, and inventing a CHS address for a range that never
+        // had one would be this crate making up bytes rather than
+        // keeping the ones it was given. The protective MBR is the
+        // exception and says so where it is written
+        // (`gpt_write::write_gpt_assigning_slots`): the UEFI
+        // specification requires a real CHS there.
+        let old = &existing[off..off + layout::ENTRY_SIZE];
+        let same_range = old[layout::TYPE_BYTE] != types::EMPTY
+            && old[layout::START_LBA..layout::START_LBA + 4] == start_lba.to_le_bytes()
+            && old[layout::SECTOR_COUNT..layout::SECTOR_COUNT + 4] == sectors.to_le_bytes();
+        if same_range {
+            let chs: [u8; 7] = old[1..8].try_into().expect("seven bytes");
+            sector[off + 1..off + 4].copy_from_slice(&chs[0..3]);
+            sector[off + 5..off + 8].copy_from_slice(&chs[4..7]);
+        }
         sector[off + layout::TYPE_BYTE] = type_byte;
         sector[off + layout::START_LBA..off + layout::START_LBA + 4]
             .copy_from_slice(&start_lba.to_le_bytes());
@@ -565,5 +693,49 @@ mod complement_tests {
             .find(|r| r.slot == 2)
             .expect("the container");
         assert_eq!(&container.bytes[..], &lba0[off..off + layout::ENTRY_SIZE]);
+    }
+}
+
+#[cfg(test)]
+mod chs_tests {
+    use super::chs_for_lba;
+
+    /// The addresses `sgdisk` 1.0.10 wrote for the last block of images
+    /// of each size, read straight out of byte 451..454 of the disks it
+    /// made. This crate wrote `FF FF FF` for every one of them before
+    /// the oracle put the two side by side.
+    #[test]
+    fn the_addresses_match_the_ones_sgdisk_writes() {
+        // 8 MiB, 64 MiB, 512 MiB: the last block of each.
+        assert_eq!(chs_for_lba(16_383), [0x05, 0x04, 0x01]);
+        assert_eq!(chs_for_lba(131_071), [0x28, 0x20, 0x08]);
+        assert_eq!(chs_for_lba(1_048_575), [0x45, 0x04, 0x41]);
+        // 8 GiB: cylinder 1044, past the ten bits a CHS address has.
+        assert_eq!(chs_for_lba(16_777_215), [0xFF, 0xFF, 0xFF]);
+    }
+
+    /// Sector numbers are one-based, so LBA 0 is sector 1 and not
+    /// sector 0 -- the off-by-one that makes a CHS address wrong by a
+    /// sector everywhere.
+    #[test]
+    fn the_first_block_is_cylinder_zero_head_zero_sector_one() {
+        assert_eq!(chs_for_lba(0), [0x00, 0x01, 0x00]);
+        // LBA 1 is where a protective entry starts, and the canonical
+        // bytes for it are head 0, sector 2, cylinder 0.
+        assert_eq!(chs_for_lba(1), [0x00, 0x02, 0x00]);
+    }
+
+    /// The cylinder's top two bits ride above the sector number in the
+    /// middle byte, which is the encoding's one trap.
+    #[test]
+    fn a_cylinder_past_255_puts_its_high_bits_above_the_sector() {
+        // Cylinder 256, head 0, sector 1.
+        let lba = 256 * 255 * 63;
+        assert_eq!(chs_for_lba(lba), [0x00, 0x01 | (1 << 6), 0x00]);
+        // Cylinder 1023 is the last that fits; 1024 is the first that
+        // does not.
+        let last = 1023 * 255 * 63;
+        assert_eq!(chs_for_lba(last), [0x00, 0x01 | (3 << 6), 0xFF]);
+        assert_eq!(chs_for_lba(1024 * 255 * 63), [0xFF, 0xFF, 0xFF]);
     }
 }

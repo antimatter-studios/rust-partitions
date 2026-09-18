@@ -430,11 +430,19 @@ pub(crate) fn write_gpt_assigning_slots(
     mbr[448] = 0x02;
     mbr[449] = 0x00;
     mbr[450] = crate::mbr::types::GPT_PROTECTIVE;
-    // CHS last sector — set to 0xFF 0xFF 0xFF (max) per the legacy convention
-    // when the LBA range exceeds what CHS can express.
-    mbr[451] = 0xFF;
-    mbr[452] = 0xFF;
-    mbr[453] = 0xFF;
+    // CHS last sector — the address of the disk's last block, or
+    // 0xFFFFFF when that does not fit in ten cylinder bits. This was
+    // 0xFFFFFF unconditionally, which the UEFI specification only
+    // allows for the second case and which disagreed with `sgdisk` on
+    // every disk below about 7.8 GiB. See `mbr::chs_for_lba`.
+    let last_chs = crate::mbr::chs_for_lba(
+        // The protective entry covers LBA 1 through the last block it
+        // can name, which is where its sector count stops too.
+        (total_sectors - 1).min(crate::MBR_LBA_MAX),
+    );
+    mbr[451] = last_chs[0];
+    mbr[452] = last_chs[1];
+    mbr[453] = last_chs[2];
     // starting LBA = 1
     mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
     // size in sectors = min(disk_sectors - 1, 0xFFFFFFFF). Per the spec, the
@@ -665,11 +673,42 @@ fn hybrid_lba0(
             bytes[at..at + 4].try_into().expect("four bytes"),
         ))
     };
+    // A HYBRID DISK'S 0xEE ENTRY IS NOT THE ONE THIS WRITER WOULD MAKE,
+    // AND THAT IS THE POINT OF IT.
+    //
+    // On a plain GPT disk the marker covers the whole device, so
+    // rebuilding it from the device's size is right -- it is how a
+    // resized image gets a protective entry that matches the disk it is
+    // now on, and sfdisk says `GPT PMBR size mismatch` about one that
+    // does not.
+    //
+    // On a hybrid disk it is deliberately narrow. `sgdisk -h` writes a
+    // marker spanning only the GPT header and entry array -- LBA 1
+    // through 2047 on the disks it makes -- precisely so the mirrored
+    // entries beside it describe real partitions rather than sitting
+    // inside a protective entry that claims the whole device. Measured
+    // on a 64 MiB image: `sgdisk -h 1:EE` wrote `EE` over sectors
+    // 1..2047, and a probe-then-commit through this crate that edited
+    // nothing replaced it with one over sectors 1..131071 -- covering
+    // the mirrored 0x83 entry it sits next to, which is not a hybrid
+    // MBR any more but a malformed one.
+    //
+    // So the two cases are told apart by what LBA 0 already is:
+    // `is_protective` is exactly the question "is this a bare
+    // protective MBR", and a hybrid one keeps the marker it came with,
+    // byte for byte, like every other entry here.
+    let rebuild_marker = crate::mbr::is_protective(current);
     let mut marker_slot = None;
     for entry in lba0 {
         let type_byte = entry.bytes[layout::TYPE_BYTE];
         if type_byte == types::GPT_PROTECTIVE {
+            let first = marker_slot.is_none();
             marker_slot.get_or_insert(entry.slot as usize);
+            if first && !rebuild_marker {
+                let at = layout::entry_at(entry.slot as usize);
+                out[at..at + layout::ENTRY_SIZE].copy_from_slice(&entry.bytes);
+                continue;
+            }
             continue;
         }
         let sectors = field(&entry.bytes, layout::SECTOR_COUNT);
@@ -685,16 +724,22 @@ fn hybrid_lba0(
         let at = layout::entry_at(entry.slot as usize);
         out[at..at + layout::ENTRY_SIZE].copy_from_slice(&entry.bytes);
     }
-    let slot = marker_slot
-        .or_else(|| {
-            (0..layout::ENTRY_COUNT)
-                .find(|&i| out[layout::entry_at(i) + layout::TYPE_BYTE] == types::EMPTY)
-        })
-        .ok_or(Error::Invalid(
-            "LBA 0 has no protective entry and no free slot for one",
-        ))?;
-    let at = layout::entry_at(slot);
-    out[at..at + layout::ENTRY_SIZE].copy_from_slice(&protective);
+    // A hybrid LBA 0 whose marker was kept above needs nothing more; a
+    // bare protective one, or one with no marker at all, gets the entry
+    // built from the device's current size.
+    let keep_existing = !rebuild_marker && marker_slot.is_some();
+    if !keep_existing {
+        let slot = marker_slot
+            .or_else(|| {
+                (0..layout::ENTRY_COUNT)
+                    .find(|&i| out[layout::entry_at(i) + layout::TYPE_BYTE] == types::EMPTY)
+            })
+            .ok_or(Error::Invalid(
+                "LBA 0 has no protective entry and no free slot for one",
+            ))?;
+        let at = layout::entry_at(slot);
+        out[at..at + layout::ENTRY_SIZE].copy_from_slice(&protective);
+    }
     out[510] = 0x55;
     out[511] = 0xAA;
     Ok(out)
