@@ -2480,3 +2480,190 @@ fn the_c_abi_recovers_from_the_backup_and_reports_the_source() {
         fs_core::ffi::fs_core_device_close(handle);
     }
 }
+
+// ---------------------------------------------------------------------------
+// What LBA 0 carries that is not the four entries (#101), and the CHS
+// bytes the UEFI specification asks the protective entry for.
+//
+// These arrived with the external-tool oracle (tests/oracle_tools.rs),
+// which is where the three defects below were measured against `sgdisk`
+// and `sfdisk`. They are restated here as ordinary tests because the
+// oracle only runs on Linux with those tools installed, and a
+// regression in any of them is a regression on macOS and Windows too.
+// ---------------------------------------------------------------------------
+
+/// A commit that changed nothing keeps the boot code and the disk
+/// identifier (#101).
+///
+/// The identifier at 440..444 is what Linux turns into every `PARTUUID`
+/// on an MBR disk, and zeroing it renamed every partition on a round
+/// trip that reported success. The boot code in 0..440 is the larger
+/// loss beside it.
+#[test]
+fn an_unchanged_mbr_commit_keeps_the_boot_code_and_the_disk_identifier() {
+    let dev = MemDev::new(64 * 1024 * 1024);
+
+    // Boot code, then a disk identifier, then a table `probe` can read.
+    let boot: Vec<u8> = (0..440u32).map(|i| (i % 251) as u8 + 1).collect();
+    dev.write_at(0, &boot).unwrap();
+    dev.write_at(440, &[0xD4, 0x58, 0x59, 0xB0]).unwrap();
+    let mut entry = [0u8; 16];
+    entry[0] = 0x80;
+    entry[4] = 0x83;
+    entry[8..12].copy_from_slice(&2048u32.to_le_bytes());
+    entry[12..16].copy_from_slice(&16384u32.to_le_bytes());
+    dev.write_at(446, &entry).unwrap();
+    dev.write_at(510, &[0x55, 0xAA]).unwrap();
+
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    assert_eq!(set.table_kind, TableKind::Mbr);
+    set.commit(&dev).unwrap();
+
+    let mut after = [0u8; 512];
+    dev.read_at(0, &mut after).unwrap();
+    assert_eq!(&after[..440], &boot[..], "the boot code was overwritten");
+    assert_eq!(
+        &after[440..444],
+        &[0xD4, 0x58, 0x59, 0xB0],
+        "the disk identifier was zeroed, so every PARTUUID on the disk changed"
+    );
+}
+
+/// An entry whose sectors did not change keeps its CHS bytes, and a new
+/// one still gets zeros.
+#[test]
+fn an_mbr_entry_that_did_not_move_keeps_its_chs_bytes() {
+    let dev = MemDev::new(64 * 1024 * 1024);
+    let mut entry = [0u8; 16];
+    entry[1..4].copy_from_slice(&[0x00, 0x20, 0x21]);
+    entry[4] = 0x83;
+    entry[5..8].copy_from_slice(&[0x41, 0x01, 0x00]);
+    entry[8..12].copy_from_slice(&2048u32.to_le_bytes());
+    entry[12..16].copy_from_slice(&16384u32.to_le_bytes());
+    dev.write_at(446, &entry).unwrap();
+    dev.write_at(510, &[0x55, 0xAA]).unwrap();
+
+    let mut set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+    let mut after = [0u8; 512];
+    dev.read_at(0, &mut after).unwrap();
+    assert_eq!(&after[447..450], &[0x00, 0x20, 0x21], "first CHS lost");
+    assert_eq!(&after[451..454], &[0x41, 0x01, 0x00], "last CHS lost");
+
+    // Move it, and the CHS no longer describes it, so it goes to zeros
+    // rather than staying wrong.
+    set.partitions[0].start = 4096 * 512;
+    set.commit(&dev).unwrap();
+    dev.read_at(0, &mut after).unwrap();
+    assert_eq!(&after[447..450], &[0x00, 0x00, 0x00], "stale CHS kept");
+    assert_eq!(&after[451..454], &[0x00, 0x00, 0x00], "stale CHS kept");
+}
+
+/// The protective entry's ending CHS is the disk's last block when that
+/// fits, and `FF FF FF` when it does not.
+///
+/// The values are `sgdisk` 1.0.10's, measured on images of exactly
+/// these sizes: it is the reference every other reader was built
+/// against, and this crate wrote `FF FF FF` for all of them.
+#[test]
+fn the_protective_entrys_ending_chs_is_the_last_block_when_it_fits() {
+    for (size, want) in [
+        (8 * 1024 * 1024u64, [0x05, 0x04, 0x01]),
+        (64 * 1024 * 1024, [0x28, 0x20, 0x08]),
+        (512 * 1024 * 1024, [0x45, 0x04, 0x41]),
+        (8 * 1024 * 1024 * 1024, [0xFF, 0xFF, 0xFF]),
+    ] {
+        let dev = MemDev::new(size as usize);
+        let set = PartitionSet::empty_gpt(size);
+        set.commit(&dev).unwrap();
+        let mut lba0 = [0u8; 512];
+        dev.read_at(0, &mut lba0).unwrap();
+        assert_eq!(lba0[450], 0xEE, "{size}: not a protective entry");
+        assert_eq!(
+            &lba0[451..454],
+            &want[..],
+            "{size}: ending CHS disagrees with sgdisk"
+        );
+    }
+}
+
+/// A hybrid MBR's `0xEE` marker is narrow on purpose, and a commit that
+/// changed nothing keeps it.
+///
+/// `sgdisk -h` writes a marker over the GPT's own region only, so the
+/// mirrored entries beside it describe real partitions. Replacing it
+/// with a whole-disk one puts the mirrored entry inside it.
+#[test]
+fn an_unchanged_gpt_commit_keeps_a_hybrid_mbrs_narrow_marker() {
+    let dev = MemDev::new(64 * 1024 * 1024);
+    let mut set = PartitionSet::empty_gpt(64 * 1024 * 1024);
+    let i = set
+        .add(
+            Some(2048 * 512),
+            8 * 1024 * 1024,
+            PartitionTypeId::LinuxFilesystem,
+            Some("root".into()),
+        )
+        .unwrap();
+    let (start_lba, _) = set.partitions[i].sector_span().unwrap();
+    let sectors = (set.partitions[i].length / 512) as u32;
+    set.commit(&dev).unwrap();
+
+    // Make it hybrid the way sgdisk does: the mirrored entry in slot 0,
+    // a marker over LBA 1..2047 in slot 1.
+    let mut mirrored = [0u8; 16];
+    mirrored[4] = 0x83;
+    mirrored[8..12].copy_from_slice(&(start_lba as u32).to_le_bytes());
+    mirrored[12..16].copy_from_slice(&sectors.to_le_bytes());
+    let mut marker = [0u8; 16];
+    marker[2] = 0x02;
+    marker[4] = 0xEE;
+    marker[5..8].copy_from_slice(&[0x20, 0x20, 0x00]);
+    marker[8..12].copy_from_slice(&1u32.to_le_bytes());
+    marker[12..16].copy_from_slice(&2047u32.to_le_bytes());
+    dev.write_at(446, &mirrored).unwrap();
+    dev.write_at(462, &marker).unwrap();
+
+    let mut before = [0u8; 512];
+    dev.read_at(0, &mut before).unwrap();
+
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+
+    let mut after = [0u8; 512];
+    dev.read_at(0, &mut after).unwrap();
+    assert_eq!(
+        &after[..],
+        &before[..],
+        "a commit that changed nothing rewrote a hybrid LBA 0"
+    );
+}
+
+/// A plain protective MBR is still rebuilt from the device's size, so a
+/// resized image gets a marker that matches the disk it is now on.
+///
+/// This is the other side of the rule above and the reason it is stated
+/// as "is LBA 0 hybrid" rather than "is there a marker": preserving
+/// every marker verbatim would leave a stale one on a grown disk, which
+/// is what `sfdisk` calls a `GPT PMBR size mismatch`.
+#[test]
+fn a_plain_protective_marker_is_rebuilt_from_the_devices_size() {
+    let dev = MemDev::new(64 * 1024 * 1024);
+    let set = PartitionSet::empty_gpt(64 * 1024 * 1024);
+    set.commit(&dev).unwrap();
+
+    // Make the marker stale, as a grown image's would be.
+    dev.write_at(446 + 12, &1000u32.to_le_bytes()).unwrap();
+
+    let set = PartitionSet::from_probe(&dev).unwrap();
+    set.commit(&dev).unwrap();
+
+    let mut lba0 = [0u8; 512];
+    dev.read_at(0, &mut lba0).unwrap();
+    let sectors = u32::from_le_bytes(lba0[446 + 12..446 + 16].try_into().unwrap());
+    assert_eq!(
+        sectors,
+        (64 * 1024 * 1024u64 / 512 - 1) as u32,
+        "a plain protective marker was left stale"
+    );
+}

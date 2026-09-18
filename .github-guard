@@ -48,8 +48,20 @@
 # the job named `test-release` carrying `name: test (release)`. The two
 # spellings are not interchangeable and a wrong one is a check that never
 # reports.
+#
+# ADDED 2026-09-18 for #119: `oracle (external tools)`. It is the job
+# that runs tests/oracle_tools.rs -- this crate's tables against sgdisk,
+# sfdisk, blkid and partx, in both directions -- and it is the only
+# check here that is not this crate marking its own homework. It reports
+# under that exact name because ci.yml's job `oracle` carries
+# `name: oracle (external tools)`; the spelling has one space either
+# side of nothing and brackets with no spaces inside them, like
+# `test (release)` above. Undeclared, it would be a job that can go red
+# without blocking a merge, which is the failure the rest of this file
+# was written about.
 [checks]
 	required = fmt
+	required = oracle (external tools)
 	required = test (release)
 	required = test / macos-latest
 	required = test / ubuntu-latest
