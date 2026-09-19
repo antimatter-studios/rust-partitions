@@ -8,6 +8,29 @@ never does.
 
 ### Added
 
+- **The parsers are fuzzed, on two tiers.** This crate is the first thing
+  to touch an untrusted disk — it reads sector 0 before anything has
+  established what the device even is, and whatever it decides sends the
+  bytes to some other parser — and nothing here had a fuzz target.
+  `fuzz/` holds four `cargo-fuzz` targets and runs nightly on a bounded
+  budget; `tests/fuzz_decoders.rs` is the gate, replaying and mutating the
+  same corpus deterministically on the stable toolchain in a fifth of a
+  second.
+
+  The corpus is five disks `sgdisk` and `sfdisk` wrote — an ordinary GPT,
+  one with sixteen entries, one carrying a real filesystem, an MBR with
+  four primaries, and an MBR with an extended container and a logical
+  chain — at 256 KiB each, which is a whole disk as far as a partition
+  table is concerned. Plus the window `classify` reads, cut from
+  filesystems `mke2fs`, `mkfs.vfat`, `mkswap` and `mksquashfs` wrote.
+
+  Two of the tests are oracles rather than fuel.
+  `every_committed_disk_probes_to_the_table_the_tool_wrote` checks the
+  table kind and partition count against what the tool actually wrote.
+  `the_sniffer_agrees_with_the_tool_that_made_each_window` checks each
+  classification against the tool that produced the filesystem — both on
+  a machine with none of those tools installed (#125).
+
 - **This crate's tables are checked against `sgdisk`, `sfdisk`, `blkid` and
   `partx`.** `tests/oracle_tools.rs` builds every table shape the crate can
   write and requires the reference tools to report it field by field -- table

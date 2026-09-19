@@ -6,6 +6,11 @@ license = "MIT"
 description = "Pure-Rust partition-table probe (GPT/MBR) and filesystem-magic sniffer."
 repository = "https://github.com/antimatter-studios/rust-partitions"
 
+# The fuzz crate is its own package, on its own toolchain, and is not
+# part of this one. Without this, `cargo package` and `cargo publish`
+# try to include it and fail on the nightly-only dependency.
+exclude = ["fuzz"]
+
 [lib]
 # Published as `am-partitions` on crates.io; consumers `use partitions::...`
 # inside their code. Decoupling the package name from the lib name keeps the

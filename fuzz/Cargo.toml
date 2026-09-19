@@ -1,0 +1,51 @@
+[package]
+name = "partitions-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The explorer half of the fuzzing setup. The gate half is
+# tests/fuzz_decoders.rs in the parent crate, which replays and mutates
+# the same corpus on the stable toolchain -- see that file's header for
+# why the work is split in two.
+#
+# Run one target:
+#   cargo +nightly fuzz run device -- -max_total_time=60
+# Run all of them, which is what CI does:
+#   scripts/fuzz-all.sh 60
+
+[dependencies]
+libfuzzer-sys = "0.4"
+am-partitions = { path = ".." }
+am-fs-core = { path = "../../rust-fs-core", version = "0.2.10" }
+
+[[bin]]
+name = "device"
+path = "fuzz_targets/device.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mbr"
+path = "fuzz_targets/mbr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gpt_header"
+path = "fuzz_targets/gpt_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sniff"
+path = "fuzz_targets/sniff.rs"
+test = false
+doc = false
+bench = false
