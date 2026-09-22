@@ -8,6 +8,16 @@ never does.
 
 ### Added
 
+- **One check gates a merge, and it stands for every job.** `ci.yml` grows an
+  always-run `ci-ok` job that `needs:` every other job in the workflow and
+  fails when any of them failed, was cancelled or was *skipped*, and
+  `.github-guard` now requires that one name instead of the six real check
+  names it used to list. A renamed job, an added matrix leg or a job split in
+  two no longer changes what gates a merge without anyone deciding to, and a
+  required check that no job produces — which GitHub reads as permanently
+  pending, with nothing to point at — can no longer be left behind by a
+  rename. `tests/ci_aggregate_gate.rs` holds both halves to it.
+
 - **The parsers are fuzzed, on two tiers.** This crate is the first thing
   to touch an untrusted disk — it reads sector 0 before anything has
   established what the device even is, and whatever it decides sends the
