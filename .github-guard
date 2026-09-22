@@ -3,66 +3,58 @@
 # git-config format: check with `git config -f .github-guard --list`, and
 # double-quote any value containing # or ;.
 
-# Required status checks for main. A declaration beats discovery exactly.
+# What must pass before main takes a merge. github-guard reads this from the
+# default branch on the server and applies it to branch protection.
 #
-# Discovery requires checks BY JOB NAME, which is a guess at the PR gate and
-# drifts silently: a renamed job, an added workflow, or any future check
-# reporting under the github-actions app changes what is required without
-# anyone deciding to. Pinning it costs nothing and makes the intent reviewable.
+#   ci-ok   ci.yml: the one always-run gate. It `needs:` every other job in
+#           that workflow and fails when any of them failed, was cancelled or
+#           was SKIPPED -- the `test` matrix on ubuntu, macOS and Windows, the
+#           release-profile run, the oracle suite that checks this crate's
+#           tables against sgdisk, sfdisk, blkid and partx, and fmt.
 #
-# THIS ONE IS A PIN, NOT A CORRECTION, AND THAT IS THE REASON TO WRITE IT.
-# Measured 2026-09-17 against this repository: branch protection already
-# required exactly the five names below, and ci.yml on main (commit b9a9d82,
-# run 35176029936) produced exactly those five and nothing else -- on main's
-# check-runs and on the last pull_request check-suite (95263140349, #115)
-# alike. Nothing is being fixed here. What is being fixed is that the list
-# lived only on the settings page, where it has no diff, no reviewer and no
-# history: the next matrix leg added to ci.yml reports under a new name,
-# nobody adds it to the required set, and the repository is one job greener
-# than it is tested with no commit to point at. The sibling rust-img-qcow2
-# is that failure already -- it produces `test / i686-unknown-linux-gnu`,
-# which was never required, so a red leg there never blocked a merge. This
-# file is where that divergence becomes a pull request instead of a surprise.
-# See the constellation audit, diskjockey#197 (sections 1 and 7).
+# WHY ONE NAME AND NOT SIX (#124). This list used to name the six real check
+# names: `fmt`, `test (release)`, `oracle (external tools)` and the three
+# `test / <os>` matrix legs. Every one of them was correct when it was
+# written, and that is the problem -- nothing kept it correct. Adding a
+# fourth runner to the matrix, renaming `oracle`, or splitting `fmt` into
+# `fmt` + `clippy` each produce a check that reports on every pull request
+# and gates nothing, with no diff anywhere in this repository to say so. The
+# sibling rust-img-qcow2 is that failure already: it produces
+# `test / i686-unknown-linux-gnu`, which was never required, so a red leg
+# there never blocked a merge.
 #
-# Every name here runs on `pull_request`, which is the only kind that can
-# gate one. release.yml's `test` and `publish to crates.io` jobs trigger on
-# a `v*.*.*` tag, after the merge they would be gating has already happened,
-# so declaring either would require a check that never reports on a pull
-# request and would block every merge permanently. They are deliberately
-# absent. No third-party reviewer app reports on this repository today;
+# The opposite spelling is worse. A required context that no job produces
+# reads to GitHub as permanently pending, and with enforce_admins on nothing
+# merges and there is no failure to point at. Both directions come from the
+# required list naming individual jobs rather than one gate.
+#
+# THE NAME DOES NOT MOVE WHEN THE JOBS DO, which is what makes this safe to
+# change. github-guard reads this file from the DEFAULT BRANCH, so a pull
+# request that renames a gating job can never also be the one whose
+# protection learns the new name -- it would leave the old name required and
+# never reporting. Requiring the aggregate means the jobs behind it can be
+# renamed, split or replaced wholesale in a single pull request that
+# protection never notices.
+#
+# ONLY ci.yml CAN GATE, WHICH IS WHY ci-ok LIVES THERE AND NEEDS ONLY ITS
+# JOBS. release.yml's `test` and `publish to crates.io` jobs trigger on a
+# `v*.*.*` tag, after the merge they would be gating has already happened.
+# fuzz.yml is `workflow_dispatch` plus a nightly cron and never sees a pull
+# request at all. Requiring anything from either would require a check that
+# never reports on a pull request, which GitHub reads as pending forever --
+# a permanent block on every merge with enforce_admins on. They stay absent.
+# No
+# third-party reviewer app reports on this repository today, and
 # github-protect-main.sh filters `select(.app.slug=="github-actions")` on
 # every one of its queries in any case, so one appearing later cannot become
 # required by accident.
 #
-# There is no aggregate `ci-ok`-style job here that `needs:` the rest, so the
-# real job names are declared. An aggregate is the better end state -- it
-# makes the required set one name that cannot drift -- but adding one is a
-# workflow change with its own reasoning and does not belong in the commit
-# that writes down what is already true.
+# tests/ci_aggregate_gate.rs holds both halves to this -- every job in ci.yml
+# has to be in `ci-ok`'s `needs`, and this file has to require `ci-ok` and
+# nothing else. Without that the aggregate drifts exactly as the named list
+# did: a job added to ci.yml and not to `needs` is invisible again.
 #
-# Names must match the check-run names GitHub reports, including the
-# "test / <os>" job-matrix spelling, which has spaces around the slash
-# because Actions renders `name: test / ${{ matrix.os }}`. `test (release)`
-# has no spaces around its brackets and is not a matrix leg at all -- it is
-# the job named `test-release` carrying `name: test (release)`. The two
-# spellings are not interchangeable and a wrong one is a check that never
-# reports.
-#
-# ADDED 2026-09-18 for #119: `oracle (external tools)`. It is the job
-# that runs tests/oracle_tools.rs -- this crate's tables against sgdisk,
-# sfdisk, blkid and partx, in both directions -- and it is the only
-# check here that is not this crate marking its own homework. It reports
-# under that exact name because ci.yml's job `oracle` carries
-# `name: oracle (external tools)`; the spelling has one space either
-# side of nothing and brackets with no spaces inside them, like
-# `test (release)` above. Undeclared, it would be a job that can go red
-# without blocking a merge, which is the failure the rest of this file
-# was written about.
+# The name must match the check-run name GitHub reports, which is the job's
+# `name:` rather than its key -- `ci-ok` for both.
 [checks]
-	required = fmt
-	required = oracle (external tools)
-	required = test (release)
-	required = test / macos-latest
-	required = test / ubuntu-latest
-	required = test / windows-latest
+	required = ci-ok

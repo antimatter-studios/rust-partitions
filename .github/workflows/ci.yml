@@ -276,3 +276,30 @@ jobs:
           components: rustfmt
       - name: fmt --check
         run: cargo fmt --check
+
+  ci-ok:
+    name: ci-ok
+    # THE ONE REQUIRED CHECK (#124). Branch protection used to name six
+    # contexts by hand -- `fmt`, `test (release)`, the three
+    # `test / <os>` matrix legs and `oracle (external tools)`. Requiring
+    # this gate instead means a leg can be added to the matrix, the
+    # oracle job renamed, or a job split in two, without leaving a
+    # required check that never reports -- which GitHub reads as
+    # permanently pending, with enforce_admins on and nothing to point
+    # at. It is also the only shape in which a job-level `if:` is safe.
+    if: always()
+    needs: [test, test-release, oracle, fmt]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad="$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $bad (failed, cancelled or skipped)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"
