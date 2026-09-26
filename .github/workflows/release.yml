@@ -13,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   # The am-fs-core tag both jobs clone. Stated once so a bump cannot give
   # the test and publish jobs different siblings (#87).
-  FS_CORE_REF: v0.2.10
+  FS_CORE_REF: v0.2.13
 
 jobs:
   test:
